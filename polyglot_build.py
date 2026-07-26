@@ -30,6 +30,8 @@ import struct
 import sys
 import os
 import time
+import shutil
+import zipfile
 
 # ============================================================
 # ZIP 常量定义
@@ -257,7 +259,7 @@ def build_data_descriptor(crc, compressed_size, uncompressed_size):
         return struct.pack('<IIII', header, crc, compressed_size, uncompressed_size)
 
 
-def build_polyglot(outer_path, rar_path, output_path, callback=None):
+def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP_STORED):
     """
     构建 polyglot 文件
     
@@ -266,12 +268,12 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None):
         rar_path: 加密 RAR 文件路径
         output_path: 输出文件路径
         callback: 进度回调函数 callback(phase, current, total, message)
+        method: 压缩方法 (COMP_STORED=不压缩[默认], COMP_DEFLATE=Deflate)
     
     返回:
         成功返回 True，失败抛出异常
     """
     import tempfile
-    import shutil
     
     outer_name = os.path.basename(outer_path)
     rar_name = os.path.basename(rar_path)
@@ -292,10 +294,24 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None):
     outer_size = os.path.getsize(outer_source)
     rar_size = os.path.getsize(rar_path)
     
+    # === P0: 磁盘空间预检 ===
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    disk_free = shutil.disk_usage(output_dir).free
+    required_space = outer_size + rar_size + 1024  # ZIP 结构开销
+    if disk_free < required_space:
+        raise IOError(
+            f'磁盘空间不足: 需要 {format_size(required_space)}，'
+            f'剩余 {format_size(disk_free)}'
+        )
     if callback:
+        callback('info', 0, 0, f'磁盘剩余空间: {format_size(disk_free)} (充足)')
+    
+    if callback:
+        method_name = 'Store (不压缩)' if method == COMP_STORED else 'Deflate'
         callback('start', 0, rar_size, f'外层文件: {outer_name} ({format_size(outer_size)})')
         callback('start', 0, rar_size, f'RAR 文件: {rar_name} ({format_size(rar_size)})')
         callback('start', 0, rar_size, f'输出文件: {output_path}')
+        callback('start', 0, rar_size, f'压缩方式: {method_name}')
     
     # RAR 文件名使用 UTF-8 编码
     filename_bytes = rar_name.encode('utf-8')
@@ -343,55 +359,68 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None):
         # ==========================================
         # 第二步: 写入 ZIP 本地文件头
         # ==========================================
-        local_header = build_local_header(filename_bytes, flags, COMP_DEFLATE, zip64_extra)
+        local_header = build_local_header(filename_bytes, flags, method, zip64_extra)
         f_out.write(local_header)
         
         # ==========================================
-        # 第三步: 流式压缩 RAR 数据 (Deflate)
+        # 第三步: 流式处理 RAR 数据
         # ==========================================
         crc_calc = CRC32Calculator()
         compressed_size = 0
         uncompressed_size = 0
         
-        # 创建 Deflate 压缩器 (原始模式，不带 zlib 头)
-        # wbits=-15 表示原始 Deflate（ZIP 使用标准）
-        compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
-        
-        # 分块读取 RAR 并压缩写入
-        last_progress_time = time.time()
-        while True:
-            chunk = f_rar.read(CHUNK_SIZE)
-            if not chunk:
-                break
+        if method == COMP_DEFLATE:
+            # Deflate 压缩模式
+            compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
             
-            # 更新 CRC
-            crc_calc.update(chunk)
-            uncompressed_size += len(chunk)
+            last_progress_time = time.time()
+            while True:
+                chunk = f_rar.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                crc_calc.update(chunk)
+                uncompressed_size += len(chunk)
+                compressed_chunk = compressor.compress(chunk)
+                if compressed_chunk:
+                    f_out.write(compressed_chunk)
+                    compressed_size += len(compressed_chunk)
+                current_time = time.time()
+                if callback and (current_time - last_progress_time > 0.2):
+                    callback('compress', uncompressed_size, rar_size,
+                            f'正在压缩... {format_size(uncompressed_size)} / {format_size(rar_size)} '
+                            f'({uncompressed_size * 100 // rar_size if rar_size > 0 else 0}%)')
+                    last_progress_time = current_time
             
-            # 压缩并写入
-            compressed_chunk = compressor.compress(chunk)
-            if compressed_chunk:
-                f_out.write(compressed_chunk)
-                compressed_size += len(compressed_chunk)
-            
-            # 进度回调 (限制频率，避免过于频繁)
-            current_time = time.time()
-            if callback and (current_time - last_progress_time > 0.2 or not chunk):
-                callback('compress', uncompressed_size, rar_size,
-                        f'正在压缩... {format_size(uncompressed_size)} / {format_size(rar_size)} '
-                        f'({uncompressed_size * 100 // rar_size if rar_size > 0 else 0}%)')
-                last_progress_time = current_time
-        
-        # 刷新压缩器，写入最后的压缩数据
-        final_compressed = compressor.flush()
-        if final_compressed:
-            f_out.write(final_compressed)
-            compressed_size += len(final_compressed)
+            final_compressed = compressor.flush()
+            if final_compressed:
+                f_out.write(final_compressed)
+                compressed_size += len(final_compressed)
+        else:
+            # Store 模式: 直接复制，不压缩 (RAR 已高度压缩，Deflate 无收益)
+            last_progress_time = time.time()
+            while True:
+                chunk = f_rar.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                crc_calc.update(chunk)
+                uncompressed_size += len(chunk)
+                f_out.write(chunk)
+                compressed_size += len(chunk)
+                current_time = time.time()
+                if callback and (current_time - last_progress_time > 0.2):
+                    callback('compress', uncompressed_size, rar_size,
+                            f'正在写入... {format_size(uncompressed_size)} / {format_size(rar_size)} '
+                            f'({uncompressed_size * 100 // rar_size if rar_size > 0 else 0}%)')
+                    last_progress_time = current_time
         
         if callback:
-            callback('compress', uncompressed_size, rar_size,
-                    f'压缩完成: {format_size(uncompressed_size)} → {format_size(compressed_size)} '
-                    f'({compressed_size * 100 // uncompressed_size if uncompressed_size > 0 else 0}%)')
+            if method == COMP_DEFLATE:
+                callback('compress', uncompressed_size, rar_size,
+                        f'压缩完成: {format_size(uncompressed_size)} → {format_size(compressed_size)} '
+                        f'({compressed_size * 100 // uncompressed_size if uncompressed_size > 0 else 0}%)')
+            else:
+                callback('compress', uncompressed_size, rar_size,
+                        f'写入完成: {format_size(uncompressed_size)} (Store 模式，无压缩)')
         
         # ==========================================
         # 第四步: 写入数据描述符
@@ -414,7 +443,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None):
             cd_zip64_extra = generate_zip64_extra(uncompressed_size, compressed_size, local_header_offset)
         
         central_dir = build_central_dir_header(
-            filename_bytes, flags, COMP_DEFLATE,
+            filename_bytes, flags, method,
             crc_value, compressed_size, uncompressed_size,
             local_header_offset, cd_zip64_extra
         )
@@ -454,6 +483,32 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None):
         except OSError:
             pass  # 忽略清理错误
     
+    return True
+
+
+def verify_polyglot(output_path, callback=None):
+    """
+    验证构建输出的 ZIP 结构完整性
+    
+    使用 zipfile 模块打开输出文件并校验 CRC。
+    成功返回 True，失败抛出异常。
+    """
+    if callback:
+        callback('info', 0, 0, '正在验证输出文件完整性...')
+    
+    try:
+        with zipfile.ZipFile(output_path, 'r') as zf:
+            bad_file = zf.testzip()
+            if bad_file is not None:
+                raise IOError(f'CRC 校验失败: {bad_file}')
+            names = zf.namelist()
+            if not names:
+                raise IOError('ZIP 中无文件条目')
+    except zipfile.BadZipFile as e:
+        raise IOError(f'ZIP 结构损坏: {e}')
+    
+    if callback:
+        callback('info', 0, 0, f'✓ 验证通过 (CRC 正确，包含 {len(names)} 个文件)')
     return True
 
 
@@ -510,6 +565,18 @@ def main():
         '-q', '--quiet',
         action='store_true',
         help='静默模式，不显示进度'
+    )
+    
+    parser.add_argument(
+        '--deflate',
+        action='store_true',
+        help='使用 Deflate 压缩 (默认 Store 不压缩，RAR 已压缩无需再压)'
+    )
+    
+    parser.add_argument(
+        '--no-verify',
+        action='store_true',
+        help='跳过构建后 ZIP 完整性验证'
     )
     
     parser.add_argument(
@@ -578,9 +645,12 @@ def main():
     # 选择回调
     callback = None if args.quiet else progress_callback
     
+    # 确定压缩方法
+    method = COMP_DEFLATE if args.deflate else COMP_STORED
+    
     try:
         # 开始构建
-        print(f'Polyglot Builder v1.0')
+        print(f'Polyglot Builder v3.0')
         print(f'========================================')
         
         if callback:
@@ -588,7 +658,11 @@ def main():
             callback('start', 0, 0, f'RAR 文件: {args.rar_file}')
             callback('start', 0, 0, f'输出文件: {output_path}')
         
-        build_polyglot(args.outer_file, args.rar_file, output_path, callback)
+        build_polyglot(args.outer_file, args.rar_file, output_path, callback, method=method)
+        
+        # 构建后验证
+        if not args.no_verify:
+            verify_polyglot(output_path, callback)
         
         print(f'========================================')
         print(f'完成! 输出文件: {output_path}')

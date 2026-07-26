@@ -19,10 +19,12 @@ import time
 import queue
 
 try:
-    from polyglot_build import build_polyglot, format_size
+    from polyglot_build import (build_polyglot, verify_polyglot, format_size,
+                                COMP_STORED, COMP_DEFLATE)
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from polyglot_build import build_polyglot, format_size
+    from polyglot_build import (build_polyglot, verify_polyglot, format_size,
+                                COMP_STORED, COMP_DEFLATE)
 
 
 # ============================================================
@@ -253,11 +255,12 @@ class PolyglotGUI:
         main.columnconfigure(0, weight=1)
         # 行 0: 标题
         # 行 1: 文件选择卡片
-        # 行 2: 构建按钮
-        # 行 3: 进度条
-        # 行 4: 日志区 (唯一可拉伸)
-        # 行 5: 底部提示
-        main.rowconfigure(4, weight=1)
+        # 行 2: 选项 (压缩方式)
+        # 行 3: 构建按钮
+        # 行 4: 进度条
+        # 行 5: 日志区 (唯一可拉伸)
+        # 行 6: 底部提示
+        main.rowconfigure(5, weight=1)
 
         # === 标题 ===
         title = ttk.Label(main, text='Polyglot Builder',
@@ -297,15 +300,25 @@ class PolyglotGUI:
         # 外层文件变化时自动填充输出路径
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
+        # === 选项行 ===
+        opt_frame = ttk.Frame(main)
+        opt_frame.grid(row=2, column=0, sticky='w', pady=(0, 10))
+        self._deflate_var = tk.BooleanVar(value=False)
+        deflate_cb = ttk.Checkbutton(
+            opt_frame, text='Deflate 压缩 (默认不压缩，RAR 已压缩无需再压)',
+            variable=self._deflate_var
+        )
+        deflate_cb.pack(side=tk.LEFT)
+
         # === 构建按钮 (Canvas 圆角) ===
         self.build_btn = RoundedButton(
             main, text='开始构建', command=self._start_build, canvas_bg=C_BG
         )
-        self.build_btn.grid(row=2, column=0, sticky='ew', pady=(0, 14))
+        self.build_btn.grid(row=3, column=0, sticky='ew', pady=(0, 14))
 
         # === 进度条 ===
         prog_frame = ttk.Frame(main)
-        prog_frame.grid(row=3, column=0, sticky='ew', pady=(0, 12))
+        prog_frame.grid(row=4, column=0, sticky='ew', pady=(0, 12))
         prog_frame.columnconfigure(0, weight=1)
 
         self.progress = ttk.Progressbar(
@@ -321,7 +334,7 @@ class PolyglotGUI:
         # === 日志区 (浅色输出面板) ===
         log_outer = tk.Frame(main, bg=C_CARD, bd=1, relief='solid',
                              highlightbackground=C_BORDER, highlightthickness=1)
-        log_outer.grid(row=4, column=0, sticky='nsew', pady=(0, 12))
+        log_outer.grid(row=5, column=0, sticky='nsew', pady=(0, 12))
         log_outer.columnconfigure(0, weight=1)
         log_outer.rowconfigure(1, weight=1)
 
@@ -367,7 +380,7 @@ class PolyglotGUI:
             text='改后缀 .zip  →  WinRAR 打开  →  输入 RAR 密码  →  得到内容',
             font=FONT_HINT, foreground=C_TEXT_SEC, anchor=tk.CENTER
         )
-        hint.grid(row=5, column=0, sticky='ew')
+        hint.grid(row=6, column=0, sticky='ew')
 
     # --------------------------------------------------------
     # 文件选择行
@@ -483,6 +496,8 @@ class PolyglotGUI:
         self.build_thread.start()
 
     def _run(self, outer, rar, out):
+        method = COMP_DEFLATE if self._deflate_var.get() else COMP_STORED
+
         def cb(phase, cur, total, msg):
             if phase in ('start', 'info'):
                 self._log_async(msg, 'info')
@@ -496,7 +511,8 @@ class PolyglotGUI:
                 self._log_async(msg, 'success')
 
         try:
-            build_polyglot(outer, rar, out, callback=cb)
+            build_polyglot(outer, rar, out, callback=cb, method=method)
+            verify_polyglot(out, callback=cb)
             self.root.after(0, self._on_success, out)
         except Exception as e:
             self._log_async(f'构建失败: {e}', 'error')
