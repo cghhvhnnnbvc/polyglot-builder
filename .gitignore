@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / 工具缓存
+.qoder/
+.codebuddy/
+
+# 运行时临时文件
+*.tmp
+polyglot_outer_*
