@@ -32,6 +32,12 @@ import os
 import time
 import shutil
 import zipfile
+from contextlib import contextmanager
+
+# ============================================================
+# 版本号 (单一来源: GUI / CLI / bat 均需与此保持一致)
+# ============================================================
+VERSION = '3.0'
 
 # ============================================================
 # ZIP 常量定义
@@ -252,11 +258,29 @@ def build_data_descriptor(crc, compressed_size, uncompressed_size):
     
     if (compressed_size > ZIP64_SIZE_THRESHOLD or 
         uncompressed_size > ZIP64_SIZE_THRESHOLD):
-        # ZIP64 数据描述符
-        return struct.pack('<IQQQ', header, compressed_size, uncompressed_size, crc)
+        # ZIP64 数据描述符: signature(4) + CRC-32(4) + compressed(8) + uncompressed(8)
+        # 字段顺序与标准分支一致 (APPNOTE 4.3.9), 仅后两个字段扩为 8 字节
+        return struct.pack('<IIQQ', header, crc, compressed_size, uncompressed_size)
     else:
         # 标准数据描述符
         return struct.pack('<IIII', header, crc, compressed_size, uncompressed_size)
+
+
+@contextmanager
+def _auto_remove(path):
+    """上下文管理器: 退出时自动删除指定文件 (即使发生异常)。
+
+    用于清理 build_polyglot 中因输出覆盖外层文件而创建的临时副本,
+    确保构建中途异常时也不会残留含敏感数据的临时文件。
+    """
+    try:
+        yield
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP_STORED):
@@ -319,17 +343,22 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
     # 判断是否需要 ZIP64
     need_zip64 = rar_size > ZIP64_SIZE_THRESHOLD or outer_size > ZIP64_SIZE_THRESHOLD
     
-    # ZIP64 扩展字段
+    # ZIP64 扩展字段 (本地文件头)
+    # 使用数据描述符时 compressed_size 在写入本地头时尚未确定,
+    # 传 0 让 generate_zip64_extra 不写入不确定的 compressed 字段;
+    # 真实值最终写在数据描述符和中央目录中。
     zip64_extra = b''
     if need_zip64:
-        zip64_extra = generate_zip64_extra(rar_size, rar_size, outer_size)
+        _local_compressed = rar_size if method == COMP_STORED else 0
+        zip64_extra = generate_zip64_extra(rar_size, _local_compressed, outer_size)
         if callback:
             callback('info', 0, 0, '已启用 ZIP64 扩展（大文件模式）')
     
     # 组合标志位
     flags = FLAG_DATA_DESCRIPTOR | FLAG_UTF8
     
-    with open(outer_source, 'rb') as f_outer, \
+    with _auto_remove(temp_outer), \
+         open(outer_source, 'rb') as f_outer, \
          open(rar_path, 'rb') as f_rar, \
          open(output_path, 'wb') as f_out:
         
@@ -476,13 +505,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
         callback('done', total_size, total_size,
                 f'完成! 总输出大小: {format_size(total_size)}')
     
-    # 清理临时文件
-    if temp_outer and os.path.exists(temp_outer):
-        try:
-            os.remove(temp_outer)
-        except OSError:
-            pass  # 忽略清理错误
-    
+
     return True
 
 
@@ -584,7 +607,13 @@ def main():
         action='store_true',
         help='启动图形界面 (GUI 模式)'
     )
-    
+
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'Polyglot Builder v{VERSION}'
+    )
+
     args = parser.parse_args()
     
     # 如果使用 --gui 参数，启动图形界面 (在参数验证之前)
@@ -650,7 +679,7 @@ def main():
     
     try:
         # 开始构建
-        print(f'Polyglot Builder v3.0')
+        print(f'Polyglot Builder v{VERSION}')
         print(f'========================================')
         
         if callback:

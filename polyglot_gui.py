@@ -20,11 +20,11 @@ import queue
 
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
-                                COMP_STORED, COMP_DEFLATE)
+                                COMP_STORED, COMP_DEFLATE, VERSION)
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
-                                COMP_STORED, COMP_DEFLATE)
+                                COMP_STORED, COMP_DEFLATE, VERSION)
 
 
 # ============================================================
@@ -146,11 +146,17 @@ class RoundedButton(tk.Canvas):
 # 占位符输入框
 # ============================================================
 class PlaceholderEntry(ttk.Entry):
-    """带灰色占位符提示的输入框，获焦时自动清除占位文字"""
+    """带灰色占位符提示的输入框，获焦时自动清除占位文字。
+
+    维护 _auto_filled 标志以区分"程序自动同步设置"与"用户主动输入",
+    供外层路径自动跟随逻辑判断: 自动填充的值可在后续被覆盖,
+    用户主动输入的值不再被覆盖。
+    """
 
     def __init__(self, parent, placeholder='', **kw):
         self._placeholder = placeholder
         self._showing_ph = True
+        self._auto_filled = False
         self._ph_fg = '#A0A0A5'
         self._fg = kw.pop('foreground', C_TEXT)
         super().__init__(parent, **kw)
@@ -161,12 +167,18 @@ class PlaceholderEntry(ttk.Entry):
 
         self.bind('<FocusIn>', self._focus_in)
         self.bind('<FocusOut>', self._focus_out)
+        self.bind('<Key>', self._on_user_key)
+
+    def _on_user_key(self, _):
+        # 用户键入即视为非自动填充
+        self._auto_filled = False
 
     def _focus_in(self, _):
         if self._showing_ph:
             self.delete(0, tk.END)
             self.configure(foreground=self._fg)
             self._showing_ph = False
+            self._auto_filled = False
 
     def _focus_out(self, _):
         if not self.get():
@@ -174,13 +186,25 @@ class PlaceholderEntry(ttk.Entry):
                 self.insert(0, self._placeholder)
                 self.configure(foreground=self._ph_fg)
                 self._showing_ph = True
+                self._auto_filled = False
 
     def set(self, value):
-        """程序设置值时自动退出占位符状态"""
+        """程序设置值时视为非自动 (如浏览按钮结果)。"""
         self.delete(0, tk.END)
         if value:
             self.configure(foreground=self._fg)
             self._showing_ph = False
+            self._auto_filled = False
+            self.insert(0, value)
+            self.xview_moveto(1)
+
+    def set_auto(self, value):
+        """自动同步设置值 (供外层路径自动跟随); 标记为可被后续覆盖。"""
+        self.delete(0, tk.END)
+        if value:
+            self.configure(foreground=self._fg)
+            self._showing_ph = False
+            self._auto_filled = True
             self.insert(0, value)
             self.xview_moveto(1)
 
@@ -200,10 +224,68 @@ class PlaceholderEntry(ttk.Entry):
             self.insert(0, self._placeholder)
             self.configure(foreground=self._ph_fg)
             self._showing_ph = True
+            self._auto_filled = False
 
     @property
     def has_value(self):
         return not self._showing_ph and bool(self.get())
+
+    @property
+    def is_auto_filled(self):
+        return self._auto_filled
+
+
+# ============================================================
+# 输出文件保存选项 (根据外层扩展名动态生成)
+# ============================================================
+def get_output_save_options(outer_path):
+    """根据外层文件扩展名返回保存对话框的 (filetypes, defaultextension)。
+
+    当外层是受支持的多格式格式时, 将对应类型放在最前并设为默认扩展;
+    否则列出全部受支持类型, 默认 .mp4。
+    """
+    ext = os.path.splitext(outer_path)[1].lower() if outer_path else ''
+
+    # (描述, 模式). 命中项会被前置, 索引见 type_map
+    all_types = [
+        ('MP4 视频 (*.mp4)',        '*.mp4'),
+        ('JPEG 图片 (*.jpg *.jpeg)', '*.jpg *.jpeg'),
+        ('PNG 图片 (*.png)',        '*.png'),
+        ('BMP 图片 (*.bmp)',        '*.bmp'),
+        ('PDF 文档 (*.pdf)',        '*.pdf'),
+        ('MP3 音频 (*.mp3)',        '*.mp3'),
+        ('FLAC 音频 (*.flac)',      '*.flac'),
+        ('WAV 音频 (*.wav)',        '*.wav'),
+        ('MKV 视频 (*.mkv)',        '*.mkv'),
+        ('AVI 视频 (*.avi)',        '*.avi'),
+    ]
+    type_map = {
+        '.mp4': 0, '.jpg': 1, '.jpeg': 1, '.png': 2, '.bmp': 3,
+        '.pdf': 4, '.mp3': 5, '.flac': 6, '.wav': 7,
+        '.mkv': 8, '.avi': 9,
+    }
+    idx = type_map.get(ext)
+    filetypes = []
+    if idx is not None:
+        filetypes.append(all_types[idx])
+        for i, t in enumerate(all_types):
+            if i != idx:
+                filetypes.append(t)
+        default_ext = ext
+    else:
+        filetypes = list(all_types)
+        default_ext = '.mp4'
+    filetypes.append(('所有文件 (*.*)', '*.*'))
+    return filetypes, default_ext
+
+
+def _should_follow_outer(outer, has_value, is_auto_filled):
+    """判断输出条目是否应自动跟随外层路径同步。
+
+    当外层有值, 且输出条目没有"用户主动输入过的值"
+    (即当前为空, 或当前值为自动同步填充), 返回 True。
+    """
+    return bool(outer) and (not has_value or is_auto_filled)
 
 
 # ============================================================
@@ -370,7 +452,7 @@ class PolyglotGUI:
 
         # 初始欢迎信息
         self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, '$ Polyglot Builder v3.0\n', 'success')
+        self.log.insert(tk.END, f'$ Polyglot Builder v{VERSION}\n', 'success')
         self.log.insert(tk.END, '$ 选择文件后点击「开始构建」\n', 'info')
         self.log.configure(state=tk.DISABLED)
 
@@ -403,18 +485,24 @@ class PolyglotGUI:
     def _auto_output(self):
         outer = self._outer_path.get()
         out_entry = getattr(self, '_out_entry', None)
-        if outer and (out_entry is None or not out_entry.has_value):
+        if out_entry is None:
+            return
+        if _should_follow_outer(outer, out_entry.has_value,
+                                out_entry.is_auto_filled):
             self._output_path.set(outer)
-            if out_entry:
-                out_entry.set(outer)
-        elif not outer and out_entry and not out_entry.has_value:
+            out_entry.set_auto(outer)
+        elif (not outer
+              and (not out_entry.has_value or out_entry.is_auto_filled)):
             out_entry.clear()
 
     def _browse(self, var, filetypes, entry=None, save_dialog=False):
         if save_dialog:
+            # 输出行: 根据当前外层扩展名动态提供匹配的文件类型与默认扩展
+            _filetypes, _default_ext = get_output_save_options(
+                self._outer_path.get())
             path = filedialog.asksaveasfilename(
                 title='选择保存位置和文件名',
-                filetypes=filetypes, defaultextension='.mp4'
+                filetypes=_filetypes, defaultextension=_default_ext
             )
         else:
             path = filedialog.askopenfilename(title='选择文件', filetypes=filetypes)
