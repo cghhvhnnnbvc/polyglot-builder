@@ -317,10 +317,14 @@ def _cleanup_cancelled_output(output_path, outer_path, temp_outer):
 
 @contextmanager
 def _cancel_scope(output_path, outer_path, temp_outer):
-    """上下文管理器: 构建取消时自动恢复/清理半成品输出。"""
+    """上下文管理器: 构建取消或被中断时自动恢复/清理半成品输出。
+
+    同时处理 BuildCancelled (GUI stop_event) 与 KeyboardInterrupt (CLI Ctrl+C),
+    确保两种取消路径都走同一套清理逻辑。
+    """
     try:
         yield
-    except BuildCancelled:
+    except (BuildCancelled, KeyboardInterrupt):
         _cleanup_cancelled_output(output_path, outer_path, temp_outer)
         raise
 
@@ -614,7 +618,10 @@ def main():
     """主函数 - 解析命令行参数并执行构建"""
     parser = argparse.ArgumentParser(
         description='Polyglot Builder - 将媒体文件与加密 RAR 拼接为多格式文件',
-        epilog='示例: python polyglot_build.py video.mp4 game.rar -o output.mp4',
+        epilog='示例:\n'
+               '  python polyglot_build.py video.mp4 game.rar -o output.mp4\n'
+               '  python polyglot_build.py photo.jpg secret.rar -y --deflate\n'
+               '  python polyglot_build.py --gui',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -651,6 +658,12 @@ def main():
         '--no-verify',
         action='store_true',
         help='跳过构建后 ZIP 完整性验证'
+    )
+
+    parser.add_argument(
+        '-y', '--force',
+        action='store_true',
+        help='强制覆盖已存在的输出文件, 不交互询问 (适合脚本/CI)'
     )
     
     parser.add_argument(
@@ -712,8 +725,8 @@ def main():
     
     # 检查是否会覆盖
     if os.path.exists(output_path):
-        if args.quiet:
-            # 静默模式: 自动覆盖，不询问
+        if args.quiet or args.force:
+            # 静默/强制模式: 自动覆盖，不询问
             pass
         else:
             print(f'警告: 输出文件已存在，将覆盖: {output_path}')
@@ -751,6 +764,12 @@ def main():
         print(f'  2. 改后缀名为 .zip → 用 WinRAR/7-Zip 打开')
         print(f'  3. 解压后得到 RAR 文件 → 输入密码解压')
         
+    except KeyboardInterrupt:
+        print('\n已取消 (Ctrl+C), 已清理半成品输出', file=sys.stderr)
+        sys.exit(130)
+    except BuildCancelled:
+        print('\n已取消, 已清理半成品输出', file=sys.stderr)
+        sys.exit(130)
     except Exception as e:
         print(f'错误: {e}', file=sys.stderr)
         sys.exit(1)
