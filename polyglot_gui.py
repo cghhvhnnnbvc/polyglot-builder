@@ -20,11 +20,13 @@ import queue
 
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
-                                COMP_STORED, COMP_DEFLATE, VERSION)
+                                COMP_STORED, COMP_DEFLATE, VERSION,
+                                BuildCancelled)
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
-                                COMP_STORED, COMP_DEFLATE, VERSION)
+                                COMP_STORED, COMP_DEFLATE, VERSION,
+                                BuildCancelled)
 
 
 # ============================================================
@@ -35,6 +37,9 @@ C_CARD         = '#FFFFFF'   # 卡片背景
 C_PRIMARY      = '#007AFF'   # 主按钮蓝
 C_PRIMARY_H    = '#0062CC'   # 悬停蓝
 C_PRIMARY_A    = '#004C99'   # 按下蓝
+C_DANGER       = '#FF3B30'   # 取消/危险按钮红
+C_DANGER_H     = '#D93228'   # 悬停红
+C_DANGER_A     = '#B52A21'   # 按下红
 C_DISABLED     = '#C7C7CC'   # 禁用灰
 C_TEXT         = '#1D1D1F'   # 主文本
 C_TEXT_SEC     = '#86868B'   # 次文本
@@ -66,6 +71,7 @@ class RoundedButton(tk.Canvas):
 
     def __init__(self, parent, text, command=None, *,
                  bg=C_PRIMARY, fg='white', radius=5,
+                 hover_bg=None, active_bg=None,
                  font=FONT_BTN, canvas_bg=None, **kw):
         self._canvas_bg = canvas_bg or C_BG
         kw.setdefault('height', 42)
@@ -73,6 +79,8 @@ class RoundedButton(tk.Canvas):
         self._cmd = command
         self._bg = bg
         self._fg = fg
+        self._hover_bg = hover_bg or C_PRIMARY_H
+        self._active_bg = active_bg or C_PRIMARY_A
         self._text = text
         self._radius = radius
         self._font = font
@@ -86,7 +94,7 @@ class RoundedButton(tk.Canvas):
 
     def _on_enter(self, e):
         if self._enabled:
-            self._draw(C_PRIMARY_H)
+            self._draw(self._hover_bg)
 
     def _on_leave(self, e):
         if self._enabled:
@@ -94,7 +102,7 @@ class RoundedButton(tk.Canvas):
 
     def _on_press(self, e):
         if self._enabled:
-            self._draw(C_PRIMARY_A)
+            self._draw(self._active_bg)
 
     def _on_release(self, e):
         if self._enabled:
@@ -301,6 +309,7 @@ class PolyglotGUI:
 
         self.build_thread = None
         self.log_queue = queue.Queue()
+        self._stop_event = threading.Event()
 
         self._setup_styles()
         self._create_widgets()
@@ -393,10 +402,22 @@ class PolyglotGUI:
         deflate_cb.pack(side=tk.LEFT)
 
         # === 构建按钮 (Canvas 圆角) ===
+        btn_frame = ttk.Frame(main)
+        btn_frame.grid(row=3, column=0, sticky='ew', pady=(0, 14))
+        btn_frame.columnconfigure(0, weight=1)
+
         self.build_btn = RoundedButton(
-            main, text='开始构建', command=self._start_build, canvas_bg=C_BG
+            btn_frame, text='开始构建', command=self._start_build, canvas_bg=C_BG
         )
-        self.build_btn.grid(row=3, column=0, sticky='ew', pady=(0, 14))
+        self.build_btn.grid(row=0, column=0, sticky='ew')
+
+        self.cancel_btn = RoundedButton(
+            btn_frame, text='取消', command=self._cancel_build,
+            bg=C_DANGER, hover_bg=C_DANGER_H, active_bg=C_DANGER_A,
+            canvas_bg=C_BG, width=80
+        )
+        self.cancel_btn.grid(row=0, column=1, sticky='ew', padx=(10, 0))
+        self.cancel_btn.configure(state=tk.DISABLED)
 
         # === 进度条 ===
         prog_frame = ttk.Frame(main)
@@ -572,16 +593,23 @@ class PolyglotGUI:
 
         # 锁定 UI
         self.build_btn.configure(state=tk.DISABLED)
+        self.cancel_btn.configure(state=tk.NORMAL)
         self.progress['value'] = 0
         self._set_status('准备中...')
         self.log.configure(state=tk.NORMAL)
         self.log.delete(1.0, tk.END)
         self.log.configure(state=tk.DISABLED)
 
+        self._stop_event.clear()
         self.build_thread = threading.Thread(
             target=self._run, args=(outer, rar, out), daemon=True
         )
         self.build_thread.start()
+
+    def _cancel_build(self):
+        self._stop_event.set()
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._log_async('正在取消构建...', 'warning')
 
     def _run(self, outer, rar, out):
         method = COMP_DEFLATE if self._deflate_var.get() else COMP_STORED
@@ -599,15 +627,20 @@ class PolyglotGUI:
                 self._log_async(msg, 'success')
 
         try:
-            build_polyglot(outer, rar, out, callback=cb, method=method)
+            build_polyglot(outer, rar, out, callback=cb, method=method,
+                           stop_event=self._stop_event)
             verify_polyglot(out, callback=cb)
             self.root.after(0, self._on_success, out)
+        except BuildCancelled as e:
+            self._log_async(f'构建已取消: {e}', 'warning')
+            self.root.after(0, self._on_cancel)
         except Exception as e:
             self._log_async(f'构建失败: {e}', 'error')
             self.root.after(0, self._on_error, str(e))
 
     def _on_success(self, out):
         self.build_btn.configure(state=tk.NORMAL)
+        self.cancel_btn.configure(state=tk.DISABLED)
         try:
             size_str = format_size(os.path.getsize(out))
         except OSError:
@@ -626,8 +659,15 @@ class PolyglotGUI:
 
     def _on_error(self, msg):
         self.build_btn.configure(state=tk.NORMAL)
+        self.cancel_btn.configure(state=tk.DISABLED)
         self._set_status('失败')
         messagebox.showerror('构建失败', f'构建出错:\n\n{msg}')
+
+    def _on_cancel(self):
+        self.build_btn.configure(state=tk.NORMAL)
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('已取消')
+        self._set_progress(0)
 
 
 # ============================================================

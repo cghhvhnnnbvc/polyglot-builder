@@ -39,6 +39,17 @@ from contextlib import contextmanager
 # ============================================================
 VERSION = '3.0'
 
+
+class BuildCancelled(Exception):
+    """构建被用户取消时抛出的异常。"""
+
+
+def _check_stop(stop_event):
+    """如果 stop_event 被设置, 抛出 BuildCancelled。"""
+    if stop_event is not None and stop_event.is_set():
+        raise BuildCancelled('构建已被用户取消')
+
+
 # ============================================================
 # ZIP 常量定义
 # ============================================================
@@ -283,7 +294,39 @@ def _auto_remove(path):
                 pass
 
 
-def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP_STORED):
+def _cleanup_cancelled_output(output_path, outer_path, temp_outer):
+    """构建取消时清理半成品输出。
+
+    - 若输出路径与外层路径相同 (覆盖构建), 尝试从 temp_outer 恢复外层文件;
+    - 否则直接删除已生成的半成品输出文件。
+    """
+    same = os.path.abspath(output_path) == os.path.abspath(outer_path)
+    if same:
+        if temp_outer and os.path.exists(temp_outer):
+            try:
+                shutil.copy2(temp_outer, output_path)
+            except OSError:
+                pass
+    else:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _cancel_scope(output_path, outer_path, temp_outer):
+    """上下文管理器: 构建取消时自动恢复/清理半成品输出。"""
+    try:
+        yield
+    except BuildCancelled:
+        _cleanup_cancelled_output(output_path, outer_path, temp_outer)
+        raise
+
+
+def build_polyglot(outer_path, rar_path, output_path, callback=None,
+                   method=COMP_STORED, stop_event=None):
     """
     构建 polyglot 文件
     
@@ -293,9 +336,10 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
         output_path: 输出文件路径
         callback: 进度回调函数 callback(phase, current, total, message)
         method: 压缩方法 (COMP_STORED=不压缩[默认], COMP_DEFLATE=Deflate)
+        stop_event: 可选 threading.Event; 被设置后抛出 BuildCancelled
     
     返回:
-        成功返回 True，失败抛出异常
+        成功返回 True，被取消抛出 BuildCancelled，其他失败抛出异常
     """
     import tempfile
     
@@ -357,7 +401,11 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
     # 组合标志位
     flags = FLAG_DATA_DESCRIPTOR | FLAG_UTF8
     
+    # 进入长耗时 IO 前检查一次取消
+    _check_stop(stop_event)
+    
     with _auto_remove(temp_outer), \
+         _cancel_scope(output_path, outer_path, temp_outer), \
          open(outer_source, 'rb') as f_outer, \
          open(rar_path, 'rb') as f_rar, \
          open(output_path, 'wb') as f_out:
@@ -370,6 +418,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
         
         copied = 0
         while True:
+            _check_stop(stop_event)
             chunk = f_outer.read(CHUNK_SIZE)
             if not chunk:
                 break
@@ -404,6 +453,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
             
             last_progress_time = time.time()
             while True:
+                _check_stop(stop_event)
                 chunk = f_rar.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -428,6 +478,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None, method=COMP
             # Store 模式: 直接复制，不压缩 (RAR 已高度压缩，Deflate 无收益)
             last_progress_time = time.time()
             while True:
+                _check_stop(stop_event)
                 chunk = f_rar.read(CHUNK_SIZE)
                 if not chunk:
                     break
