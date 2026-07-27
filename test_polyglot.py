@@ -13,13 +13,16 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
-    COMP_STORED, ZIP64_SIZE_THRESHOLD,
+    COMP_STORED, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer
 
@@ -138,6 +141,85 @@ class TestShouldFollowOuter(unittest.TestCase):
     def test_user_edited_does_not_follow(self):
         # 用户主动改过输出后, 外层变化不应覆盖
         self.assertFalse(_should_follow_outer('a.mp4', True, False))
+
+
+class TestCancelBuild(unittest.TestCase):
+    """守护 1.1: build_polyglot 支持通过 stop_event 取消, 并正确清理半成品。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_file(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _cancel_after_first_chunk(self, outer, rar, out, stop_event):
+        """启动构建并在第一个 copy/compress 进度回调后触发取消。"""
+        progress_reached = threading.Event()
+
+        def cb(phase, cur, total, msg):
+            if phase in ('copy', 'compress') and cur > 0:
+                progress_reached.set()
+
+        def target():
+            build_polyglot(outer, rar, out, callback=cb,
+                           method=COMP_STORED, stop_event=stop_event)
+
+        # 把 CHUNK_SIZE 调小, 让回调/取消有充足机会发生
+        original_chunk = polyglot_build.CHUNK_SIZE
+        polyglot_build.CHUNK_SIZE = 64
+        try:
+            t = threading.Thread(target=target)
+            t.start()
+            self.assertTrue(progress_reached.wait(timeout=3),
+                            '构建未在预期时间内产生进度')
+            stop_event.set()
+            t.join(timeout=3)
+            self.assertFalse(t.is_alive(), '构建线程未在取消后结束')
+        finally:
+            polyglot_build.CHUNK_SIZE = original_chunk
+
+    def test_cancel_deletes_partial_output(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 2000)
+        rar = self._make_file('data.rar', b'RAR' * 2000)
+        out = os.path.join(self.tmpdir, 'output.bin')
+
+        stop = threading.Event()
+        self._cancel_after_first_chunk(outer, rar, out, stop)
+
+        self.assertFalse(os.path.exists(out),
+                         '取消后应删除非覆盖模式下的半成品输出')
+
+    def test_cancel_overwrite_restores_outer(self):
+        original = b'ORIGINAL' * 500
+        outer = self._make_file('outer.bin', original)
+        rar = self._make_file('data.rar', b'RAR' * 2000)
+
+        stop = threading.Event()
+        self._cancel_after_first_chunk(outer, rar, outer, stop)
+
+        self.assertTrue(os.path.exists(outer))
+        with open(outer, 'rb') as f:
+            self.assertEqual(f.read(), original,
+                             '覆盖模式下取消应恢复原始外层文件')
+
+    def test_cancel_raises_build_cancelled(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 2000)
+        rar = self._make_file('data.rar', b'RAR' * 2000)
+        out = os.path.join(self.tmpdir, 'output.bin')
+
+        stop = threading.Event()
+        stop.set()  # 直接取消, 不进入 IO
+
+        with self.assertRaises(BuildCancelled):
+            build_polyglot(outer, rar, out, stop_event=stop)
+
+        self.assertFalse(os.path.exists(out))
 
 
 if __name__ == '__main__':
