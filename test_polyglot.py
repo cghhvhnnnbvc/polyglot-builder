@@ -167,8 +167,11 @@ class TestCancelBuild(unittest.TestCase):
                 progress_reached.set()
 
         def target():
-            build_polyglot(outer, rar, out, callback=cb,
-                           method=COMP_STORED, stop_event=stop_event)
+            try:
+                build_polyglot(outer, rar, out, callback=cb,
+                               method=COMP_STORED, stop_event=stop_event)
+            except BuildCancelled:
+                pass  # 预期中的取消, 不必打印线程异常
 
         # 把 CHUNK_SIZE 调小, 让回调/取消有充足机会发生
         original_chunk = polyglot_build.CHUNK_SIZE
@@ -220,6 +223,97 @@ class TestCancelBuild(unittest.TestCase):
             build_polyglot(outer, rar, out, stop_event=stop)
 
         self.assertFalse(os.path.exists(out))
+
+
+class TestCLI(unittest.TestCase):
+    """守护 1.2: CLI 参数与覆盖/取消行为。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_file(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _run_main(self, argv):
+        """以给定 argv 运行 main(), 返回 (exit_code, stdout, stderr)。"""
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest import mock
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), \
+                redirect_stdout(buf_out), redirect_stderr(buf_err):
+            try:
+                polyglot_build.main()
+                exit_code = 0
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+        return exit_code, buf_out.getvalue(), buf_err.getvalue()
+
+    def test_cli_quiet_build_success(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+
+        code, _out, err = self._run_main(
+            ['polyglot_build.py', outer, rar, '-o', out, '-q'])
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(out))
+        self.assertTrue(verify_polyglot(out))
+
+    def test_cli_force_overwrites_without_prompt(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+        with open(out, 'wb') as f:
+            f.write(b'PREEXISTING')
+
+        from unittest import mock
+        # 若 input 被调用即视为失败
+        with mock.patch('builtins.input',
+                        side_effect=AssertionError('input 不应被调用')):
+            code, _out, err = self._run_main(
+                ['polyglot_build.py', outer, rar, '-o', out, '--force'])
+
+        self.assertEqual(code, 0, err)
+        with open(out, 'rb') as f:
+            self.assertNotEqual(f.read(), b'PREEXISTING',
+                                '--force 应覆盖已有文件')
+
+    def test_cli_prompt_aborts_on_no(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+        with open(out, 'wb') as f:
+            f.write(b'PREEXISTING')
+
+        from unittest import mock
+        with mock.patch('builtins.input', return_value='n'):
+            code, _out, _err = self._run_main(
+                ['polyglot_build.py', outer, rar, '-o', out])
+
+        self.assertEqual(code, 0)  # 用户拒绝, sys.exit(0)
+        with open(out, 'rb') as f:
+            self.assertEqual(f.read(), b'PREEXISTING',
+                             '用户拒绝覆盖时应保留原文件')
+
+    def test_cli_no_verify_flag_runs(self):
+        outer = self._make_file('outer.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+
+        code, _out, err = self._run_main(
+            ['polyglot_build.py', outer, rar, '-o', out, '-q', '--no-verify'])
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(out))
 
 
 if __name__ == '__main__':
