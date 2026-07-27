@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
-    COMP_STORED, ZIP64_SIZE_THRESHOLD, BuildCancelled,
+    COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer
 
@@ -92,6 +92,66 @@ class TestEndToEnd(unittest.TestCase):
 
         after = self._temp_outer_leftovers()
         self.assertEqual(after - before, set())
+
+    def test_deflate_mode_roundtrip(self):
+        # 3.1: Deflate 模式端到端, 验证压缩生效且内容/CRC 正确
+        outer = self._make_file('outer.bin', b'OUTER_HEADER' + b'\x00' * 1024)
+        payload = b'SECRET_RAR_CONTENT' * 100
+        rar = self._make_file('secret.rar', payload)
+        out = os.path.join(self.tmpdir, 'poly_def.bin')
+
+        build_polyglot(outer, rar, out, method=COMP_DEFLATE)
+        verify_polyglot(out)
+
+        with zipfile.ZipFile(out) as zf:
+            self.assertIsNone(zf.testzip())
+            self.assertEqual(zf.read(zf.namelist()[0]), payload)
+            info = zf.infolist()[0]
+            self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+            self.assertLess(info.compress_size, info.file_size,
+                            'Deflate 应实际压缩数据')
+
+    def test_zip64_boundary_roundtrip(self):
+        # 3.2: 把 ZIP64 阈值调小, 用小文件触发完整 ZIP64 路径 (Store)
+        # 守护 P0#1 (ZIP64 数据描述符字段顺序) 与本地头/中央目录 ZIP64 extra
+        original = polyglot_build.ZIP64_SIZE_THRESHOLD
+        polyglot_build.ZIP64_SIZE_THRESHOLD = 1024
+        try:
+            outer = self._make_file('outer.bin', b'OUTER' * 256)   # 1280 > 1024
+            payload = b'SECRET_RAR_CONTENT' * 120                   # > 1024
+            rar = self._make_file('secret.rar', payload)
+            out = os.path.join(self.tmpdir, 'poly_z64.bin')
+
+            build_polyglot(outer, rar, out, method=COMP_STORED)
+            verify_polyglot(out)
+
+            with zipfile.ZipFile(out) as zf:
+                self.assertIsNone(zf.testzip())
+                self.assertEqual(zf.read(zf.namelist()[0]), payload)
+        finally:
+            polyglot_build.ZIP64_SIZE_THRESHOLD = original
+
+    def test_zip64_deflate_roundtrip(self):
+        # 3.2 变体: ZIP64 + Deflate, 守护 P1 (本地头 ZIP64 extra 在 Deflate
+        # 模式下 compressed_size 传 0 不写入未知值)
+        original = polyglot_build.ZIP64_SIZE_THRESHOLD
+        polyglot_build.ZIP64_SIZE_THRESHOLD = 1024
+        try:
+            outer = self._make_file('outer.bin', b'OUTER' * 256)
+            payload = b'SECRET_RAR_CONTENT' * 200   # 高度可压缩
+            rar = self._make_file('secret.rar', payload)
+            out = os.path.join(self.tmpdir, 'poly_z64_def.bin')
+
+            build_polyglot(outer, rar, out, method=COMP_DEFLATE)
+            verify_polyglot(out)
+
+            with zipfile.ZipFile(out) as zf:
+                self.assertIsNone(zf.testzip())
+                self.assertEqual(zf.read(zf.namelist()[0]), payload)
+                info = zf.infolist()[0]
+                self.assertLess(info.compress_size, info.file_size)
+        finally:
+            polyglot_build.ZIP64_SIZE_THRESHOLD = original
 
 
 class TestOutputSaveOptions(unittest.TestCase):
