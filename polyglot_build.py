@@ -76,6 +76,10 @@ ZIP64_SIZE_THRESHOLD = 0xFFFFFFFF  # 4GB - 1
 ZIP64_CD_THRESHOLD = 0xFFFFFFFF    # 中央目录大小/偏移超过此值
 ZIP64_ENTRIES_THRESHOLD = 0xFFFF    # 条目数超过 65535
 
+# 写入 32-bit 头部字段的 ZIP64 占位标记 (规范固定为 0xFFFFFFFF, 表示"见 ZIP64 扩展")
+# 与阈值分离: 阈值可被测试 patch 以触发 ZIP64 路径, 而标记始终为规范值。
+ZIP64_MARKER = 0xFFFFFFFF
+
 
 class CRC32Calculator:
     """增量式 CRC-32 计算器，用于大文件流式处理"""
@@ -157,8 +161,11 @@ def build_zip64_eocd(num_entries, cd_size, cd_offset):
 
 
 def build_zip64_eocd_locator(zip64_eocd_offset):
-    """构建 ZIP64 EOCD Locator"""
-    return struct.pack('<IQI',
+    """构建 ZIP64 EOCD Locator (APPNOTE 4.3.11)。
+
+    字段: 签名(I) + ZIP64 EOCD 所在磁盘号(I) + 偏移(Q) + 总磁盘数(I)。
+    """
+    return struct.pack('<IIQI',
         ZIP64_EOCD_LOCATOR_SIG,  # 签名
         0,                        # ZIP64 EOCD 所在磁盘号
         zip64_eocd_offset,       # ZIP64 EOCD 的偏移量
@@ -203,9 +210,9 @@ def build_central_dir_header(filename_bytes, flags, method, crc,
     version_needed = version_made
     
     # 大小和偏移使用 32-bit 最大值
-    comp_size_to_write = compressed_size if compressed_size <= ZIP64_SIZE_THRESHOLD else ZIP64_SIZE_THRESHOLD
-    uncomp_size_to_write = uncompressed_size if uncompressed_size <= ZIP64_SIZE_THRESHOLD else ZIP64_SIZE_THRESHOLD
-    offset_to_write = local_header_offset if local_header_offset <= ZIP64_SIZE_THRESHOLD else ZIP64_SIZE_THRESHOLD
+    comp_size_to_write = compressed_size if compressed_size <= ZIP64_SIZE_THRESHOLD else ZIP64_MARKER
+    uncomp_size_to_write = uncompressed_size if uncompressed_size <= ZIP64_SIZE_THRESHOLD else ZIP64_MARKER
+    offset_to_write = local_header_offset if local_header_offset <= ZIP64_SIZE_THRESHOLD else ZIP64_MARKER
     
     header = struct.pack('<IHHHHHHIIIHHHHHII',
         CENTRAL_DIR_SIG,        # 签名
@@ -245,8 +252,8 @@ def build_eocd(num_entries, cd_size, cd_offset, comment=b''):
     entries_to_write = min(num_entries, ZIP64_ENTRIES_THRESHOLD)
     
     # 大小和偏移使用 32-bit 最大值（不能用 16-bit 的 ZIP64_ENTRIES_THRESHOLD！）
-    cd_size_to_write = cd_size if cd_size <= ZIP64_SIZE_THRESHOLD else ZIP64_SIZE_THRESHOLD
-    cd_offset_to_write = cd_offset if cd_offset <= ZIP64_SIZE_THRESHOLD else ZIP64_SIZE_THRESHOLD
+    cd_size_to_write = cd_size if cd_size <= ZIP64_SIZE_THRESHOLD else ZIP64_MARKER
+    cd_offset_to_write = cd_offset if cd_offset <= ZIP64_SIZE_THRESHOLD else ZIP64_MARKER
     
     return struct.pack('<IHHHHIIH',
         EOCD_SIG,               # 签名
@@ -327,6 +334,52 @@ def _cancel_scope(output_path, outer_path, temp_outer):
     except (BuildCancelled, KeyboardInterrupt):
         _cleanup_cancelled_output(output_path, outer_path, temp_outer)
         raise
+
+
+def _stream_copy(f_in, f_out, total_size, callback, stop_event,
+                 phase, label, crc_calc=None, compressor=None):
+    """通用流式拷贝: 读 chunk -> 可选 CRC -> 可选压缩 -> 写 -> 进度回调 -> 取消检查。
+
+    统一了 build_polyglot 中三段几乎相同的 while 循环
+    (复制外层文件 / Deflate 压缩 RAR / Store 直写 RAR)。
+
+    每 0.2s 通过 callback(phase, read, total, f'{label} {read} / {total} ({pct}%)')
+    报告进度; 每个 chunk 边界检查 stop_event; 若传入 compressor 则在结束时 flush。
+
+    返回 (bytes_written, bytes_read)。
+    """
+    written = 0
+    read = 0
+    last_progress_time = time.time()
+
+    while True:
+        _check_stop(stop_event)
+        chunk = f_in.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        if crc_calc is not None:
+            crc_calc.update(chunk)
+        read += len(chunk)
+        out_data = compressor.compress(chunk) if compressor is not None else chunk
+        if out_data:
+            f_out.write(out_data)
+            written += len(out_data)
+        current_time = time.time()
+        if callback and (current_time - last_progress_time > 0.2):
+            pct = read * 100 // total_size if total_size > 0 else 0
+            callback(phase, read, total_size,
+                     f'{label} {format_size(read)} / {format_size(total_size)} '
+                     f'({pct}%)')
+            last_progress_time = current_time
+
+    # Deflate: flush 剩余压缩数据
+    if compressor is not None:
+        final = compressor.flush()
+        if final:
+            f_out.write(final)
+            written += len(final)
+
+    return written, read
 
 
 def build_polyglot(outer_path, rar_path, output_path, callback=None,
@@ -419,7 +472,7 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None,
         # ==========================================
         if callback:
             callback('copy', 0, outer_size, f'正在复制外层文件...')
-        
+
         copied = 0
         while True:
             _check_stop(stop_event)
@@ -429,9 +482,9 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None,
             f_out.write(chunk)
             copied += len(chunk)
             if callback:
-                callback('copy', copied, outer_size, 
+                callback('copy', copied, outer_size,
                         f'正在复制外层文件... {format_size(copied)} / {format_size(outer_size)}')
-        
+
         local_header_offset = f_out.tell()
         
         if callback:
@@ -448,54 +501,19 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None,
         # 第三步: 流式处理 RAR 数据
         # ==========================================
         crc_calc = CRC32Calculator()
-        compressed_size = 0
-        uncompressed_size = 0
-        
         if method == COMP_DEFLATE:
-            # Deflate 压缩模式
             compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
-            
-            last_progress_time = time.time()
-            while True:
-                _check_stop(stop_event)
-                chunk = f_rar.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                crc_calc.update(chunk)
-                uncompressed_size += len(chunk)
-                compressed_chunk = compressor.compress(chunk)
-                if compressed_chunk:
-                    f_out.write(compressed_chunk)
-                    compressed_size += len(compressed_chunk)
-                current_time = time.time()
-                if callback and (current_time - last_progress_time > 0.2):
-                    callback('compress', uncompressed_size, rar_size,
-                            f'正在压缩... {format_size(uncompressed_size)} / {format_size(rar_size)} '
-                            f'({uncompressed_size * 100 // rar_size if rar_size > 0 else 0}%)')
-                    last_progress_time = current_time
-            
-            final_compressed = compressor.flush()
-            if final_compressed:
-                f_out.write(final_compressed)
-                compressed_size += len(final_compressed)
+            progress_label = '正在压缩...'
         else:
             # Store 模式: 直接复制，不压缩 (RAR 已高度压缩，Deflate 无收益)
-            last_progress_time = time.time()
-            while True:
-                _check_stop(stop_event)
-                chunk = f_rar.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                crc_calc.update(chunk)
-                uncompressed_size += len(chunk)
-                f_out.write(chunk)
-                compressed_size += len(chunk)
-                current_time = time.time()
-                if callback and (current_time - last_progress_time > 0.2):
-                    callback('compress', uncompressed_size, rar_size,
-                            f'正在写入... {format_size(uncompressed_size)} / {format_size(rar_size)} '
-                            f'({uncompressed_size * 100 // rar_size if rar_size > 0 else 0}%)')
-                    last_progress_time = current_time
+            compressor = None
+            progress_label = '正在写入...'
+
+        compressed_size, uncompressed_size = _stream_copy(
+            f_rar, f_out, rar_size, callback, stop_event,
+            phase='compress', label=progress_label,
+            crc_calc=crc_calc, compressor=compressor
+        )
         
         if callback:
             if method == COMP_DEFLATE:
