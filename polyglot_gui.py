@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 Polyglot Builder - 图形界面 v3.0
 
@@ -246,7 +248,7 @@ class PlaceholderEntry(ttk.Entry):
 # ============================================================
 # 输出文件保存选项 (根据外层扩展名动态生成)
 # ============================================================
-def get_output_save_options(outer_path):
+def get_output_save_options(outer_path: str) -> tuple[list[tuple[str, str]], str]:
     """根据外层文件扩展名返回保存对话框的 (filetypes, defaultextension)。
 
     当外层是受支持的多格式格式时, 将对应类型放在最前并设为默认扩展;
@@ -287,7 +289,7 @@ def get_output_save_options(outer_path):
     return filetypes, default_ext
 
 
-def _should_follow_outer(outer, has_value, is_auto_filled):
+def _should_follow_outer(outer: str, has_value: bool, is_auto_filled: bool) -> bool:
     """判断输出条目是否应自动跟随外层路径同步。
 
     当外层有值, 且输出条目没有"用户主动输入过的值"

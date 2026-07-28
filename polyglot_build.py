@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
 Polyglot Builder - 多格式文件拼接工具
 
@@ -31,8 +33,13 @@ import sys
 import os
 import time
 import shutil
+import threading
 import zipfile
 from contextlib import contextmanager
+from typing import Callable, Optional
+
+# 进度回调签名: (phase, current, total, message) -> None
+ProgressCallback = Callable[[str, int, int, str], None]
 
 # ============================================================
 # 版本号 (单一来源: GUI / CLI / bat 均需与此保持一致)
@@ -44,7 +51,7 @@ class BuildCancelled(Exception):
     """构建被用户取消时抛出的异常。"""
 
 
-def _check_stop(stop_event):
+def _check_stop(stop_event: Optional[threading.Event]) -> None:
     """如果 stop_event 被设置, 抛出 BuildCancelled。"""
     if stop_event is not None and stop_event.is_set():
         raise BuildCancelled('构建已被用户取消')
@@ -84,14 +91,14 @@ ZIP64_MARKER = 0xFFFFFFFF
 class CRC32Calculator:
     """增量式 CRC-32 计算器，用于大文件流式处理"""
     
-    def __init__(self):
+    def __init__(self) -> None:
         self.crc = 0
     
-    def update(self, data):
+    def update(self, data: bytes) -> None:
         self.crc = zlib.crc32(data, self.crc)
     
     @property
-    def value(self):
+    def value(self) -> int:
         return self.crc & 0xFFFFFFFF
 
 
@@ -104,7 +111,8 @@ def format_size(size_bytes):
     return f"{size_bytes:.1f} TB"
 
 
-def generate_zip64_extra(uncompressed_size, compressed_size, local_header_offset):
+def generate_zip64_extra(uncompressed_size: int, compressed_size: int,
+                         local_header_offset: int) -> bytes:
     """
     生成 ZIP64 扩展字段（用于中央目录和本地文件头）
     
@@ -160,7 +168,7 @@ def build_zip64_eocd(num_entries, cd_size, cd_offset):
     return zip64_eocd
 
 
-def build_zip64_eocd_locator(zip64_eocd_offset):
+def build_zip64_eocd_locator(zip64_eocd_offset: int) -> bytes:
     """构建 ZIP64 EOCD Locator (APPNOTE 4.3.11)。
 
     字段: 签名(I) + ZIP64 EOCD 所在磁盘号(I) + 偏移(Q) + 总磁盘数(I)。
@@ -173,7 +181,8 @@ def build_zip64_eocd_locator(zip64_eocd_offset):
     )
 
 
-def build_local_header(filename_bytes, flags, method, extra_field=b''):
+def build_local_header(filename_bytes: bytes, flags: int, method: int,
+                       extra_field: bytes = b'') -> bytes:
     """
     构建 ZIP 本地文件头
     
@@ -194,9 +203,10 @@ def build_local_header(filename_bytes, flags, method, extra_field=b''):
     ) + filename_bytes + extra_field
 
 
-def build_central_dir_header(filename_bytes, flags, method, crc, 
-                             compressed_size, uncompressed_size, 
-                             local_header_offset, extra_field=b'', comment=b''):
+def build_central_dir_header(filename_bytes: bytes, flags: int, method: int, crc: int,
+                             compressed_size: int, uncompressed_size: int,
+                             local_header_offset: int, extra_field: bytes = b'',
+                             comment: bytes = b'') -> bytes:
     """构建 ZIP 中央目录文件头
     
     注意：大小/偏移字段使用 32-bit 阈值 (ZIP64_SIZE_THRESHOLD)，
@@ -237,7 +247,8 @@ def build_central_dir_header(filename_bytes, flags, method, crc,
     return header + filename_bytes + extra_field + comment
 
 
-def build_eocd(num_entries, cd_size, cd_offset, comment=b''):
+def build_eocd(num_entries: int, cd_size: int, cd_offset: int,
+               comment: bytes = b'') -> bytes:
     """构建标准 End of Central Directory Record
     
     如果参数超过阈值，使用 ZIP64 占位值
@@ -267,7 +278,8 @@ def build_eocd(num_entries, cd_size, cd_offset, comment=b''):
     ) + comment
 
 
-def build_data_descriptor(crc, compressed_size, uncompressed_size):
+def build_data_descriptor(crc: int, compressed_size: int,
+                          uncompressed_size: int) -> bytes:
     """构建 ZIP 数据描述符（PK\x08\x07 签名版本，WinRAR/7-Zip 推荐）
     
     有签名版本兼容所有工具，无签名版本仅部分工具支持。
@@ -285,7 +297,7 @@ def build_data_descriptor(crc, compressed_size, uncompressed_size):
 
 
 @contextmanager
-def _auto_remove(path):
+def _auto_remove(path: Optional[str]):
     """上下文管理器: 退出时自动删除指定文件 (即使发生异常)。
 
     用于清理 build_polyglot 中因输出覆盖外层文件而创建的临时副本,
@@ -301,7 +313,8 @@ def _auto_remove(path):
                 pass
 
 
-def _cleanup_cancelled_output(output_path, outer_path, temp_outer):
+def _cleanup_cancelled_output(output_path: str, outer_path: str,
+                              temp_outer: Optional[str]) -> None:
     """构建取消时清理半成品输出。
 
     - 若输出路径与外层路径相同 (覆盖构建), 尝试从 temp_outer 恢复外层文件;
@@ -323,7 +336,7 @@ def _cleanup_cancelled_output(output_path, outer_path, temp_outer):
 
 
 @contextmanager
-def _cancel_scope(output_path, outer_path, temp_outer):
+def _cancel_scope(output_path: str, outer_path: str, temp_outer: Optional[str]):
     """上下文管理器: 构建取消或被中断时自动恢复/清理半成品输出。
 
     同时处理 BuildCancelled (GUI stop_event) 与 KeyboardInterrupt (CLI Ctrl+C),
@@ -336,8 +349,12 @@ def _cancel_scope(output_path, outer_path, temp_outer):
         raise
 
 
-def _stream_copy(f_in, f_out, total_size, callback, stop_event,
-                 phase, label, crc_calc=None, compressor=None):
+def _stream_copy(f_in, f_out, total_size: int,
+                 callback: Optional[ProgressCallback],
+                 stop_event: Optional[threading.Event],
+                 phase: str, label: str,
+                 crc_calc: Optional[CRC32Calculator] = None,
+                 compressor: Optional['zlib._Compress'] = None) -> tuple[int, int]:
     """通用流式拷贝: 读 chunk -> 可选 CRC -> 可选压缩 -> 写 -> 进度回调 -> 取消检查。
 
     统一了 build_polyglot 中三段几乎相同的 while 循环
@@ -382,8 +399,10 @@ def _stream_copy(f_in, f_out, total_size, callback, stop_event,
     return written, read
 
 
-def build_polyglot(outer_path, rar_path, output_path, callback=None,
-                   method=COMP_STORED, stop_event=None):
+def build_polyglot(outer_path: str, rar_path: str, output_path: str,
+                   callback: Optional[ProgressCallback] = None,
+                   method: int = COMP_STORED,
+                   stop_event: Optional[threading.Event] = None) -> bool:
     """
     构建 polyglot 文件
     
@@ -582,7 +601,8 @@ def build_polyglot(outer_path, rar_path, output_path, callback=None,
     return True
 
 
-def verify_polyglot(output_path, callback=None):
+def verify_polyglot(output_path: str,
+                    callback: Optional[ProgressCallback] = None) -> bool:
     """
     验证构建输出的 ZIP 结构完整性
     
@@ -608,7 +628,7 @@ def verify_polyglot(output_path, callback=None):
     return True
 
 
-def progress_callback(phase, current, total, message):
+def progress_callback(phase: str, current: int, total: int, message: str) -> None:
     """简单的命令行进度回调"""
     if phase == 'start':
         print(f'  {message}')
@@ -632,7 +652,7 @@ def progress_callback(phase, current, total, message):
         print()  # 换行
 
 
-def main():
+def main() -> None:
     """主函数 - 解析命令行参数并执行构建"""
     parser = argparse.ArgumentParser(
         description='Polyglot Builder - 将媒体文件与加密 RAR 拼接为多格式文件',
