@@ -154,6 +154,59 @@ class TestEndToEnd(unittest.TestCase):
             polyglot_build.ZIP64_SIZE_THRESHOLD = original
 
 
+class TestVerify(unittest.TestCase):
+    """守护 3.4: verify_polyglot 正/负用例。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix='polyglot_verify_')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_file(self, name, data):
+        p = os.path.join(self.tmpdir, name)
+        with open(p, 'wb') as f:
+            f.write(data)
+        return p
+
+    def _build_valid(self):
+        outer = self._make_file('outer.bin', b'OUTER_HEADER' + b'\x00' * 1024)
+        payload = b'SECRET_RAR_CONTENT' * 100
+        rar = self._make_file('secret.rar', payload)
+        out = os.path.join(self.tmpdir, 'poly.bin')
+        build_polyglot(outer, rar, out, method=COMP_STORED)
+        return out, payload
+
+    def test_verify_passes_on_valid_polyglot(self):
+        out, _ = self._build_valid()
+        self.assertTrue(verify_polyglot(out))
+
+    def test_verify_raises_on_corrupted_data(self):
+        out, _ = self._build_valid()
+        # 篡改存储数据区中的一个字节 (Store 模式下直接改变 CRC)
+        # 数据起始 = 外层大小 + 本地头(30) + 文件名长度
+        with open(out, 'r+b') as f:
+            data = f.read()
+            # 定位本地头签名后的数据区, 取一个肯定在 RAR 数据内的偏移
+            corrupt_offset = data.find(b'secret.rar') + len('secret.rar') + 10
+            f.seek(corrupt_offset)
+            orig = f.read(1)
+            f.seek(corrupt_offset)
+            f.write(bytes([orig[0] ^ 0xFF]) if orig else b'\xFF')
+        with self.assertRaises(IOError):
+            verify_polyglot(out)
+
+    def test_verify_raises_on_non_zip(self):
+        junk = self._make_file('junk.bin', b'NOT A ZIP FILE ' * 50)
+        with self.assertRaises(IOError):
+            verify_polyglot(junk)
+
+    def test_verify_raises_on_empty_file(self):
+        empty = self._make_file('empty.bin', b'')
+        with self.assertRaises(IOError):
+            verify_polyglot(empty)
+
+
 class TestOutputSaveOptions(unittest.TestCase):
     def test_jpg_outer_places_jpeg_first(self):
         filetypes, defaultext = get_output_save_options('photo.jpg')
