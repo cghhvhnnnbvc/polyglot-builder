@@ -80,7 +80,6 @@ CHUNK_SIZE = 8 * 1024 * 1024
 
 # ZIP 文件大小阈值 (ZIP64 触发条件)
 ZIP64_SIZE_THRESHOLD = 0xFFFFFFFF  # 4GB - 1
-ZIP64_CD_THRESHOLD = 0xFFFFFFFF    # 中央目录大小/偏移超过此值
 ZIP64_ENTRIES_THRESHOLD = 0xFFFF    # 条目数超过 65535
 
 # 写入 32-bit 头部字段的 ZIP64 占位标记 (规范固定为 0xFFFFFFFF, 表示"见 ZIP64 扩展")
@@ -467,10 +466,12 @@ def build_polyglot(outer_path: str, rar_path: str, output_path: str,
     # 使用数据描述符时 compressed_size 在写入本地头时尚未确定,
     # 传 0 让 generate_zip64_extra 不写入不确定的 compressed 字段;
     # 真实值最终写在数据描述符和中央目录中。
+    # 本地头 extra 不传 offset (offset 字段只属于中央目录 extra),
+    # 故第 3 个参数传 0, 确保本地头 extra 只含 uncompressed/compressed。
     zip64_extra = b''
     if need_zip64:
         _local_compressed = rar_size if method == COMP_STORED else 0
-        zip64_extra = generate_zip64_extra(rar_size, _local_compressed, outer_size)
+        zip64_extra = generate_zip64_extra(rar_size, _local_compressed, 0)
         if callback:
             callback('info', 0, 0, '已启用 ZIP64 扩展（大文件模式）')
     
@@ -606,23 +607,44 @@ def verify_polyglot(output_path: str,
     """
     验证构建输出的 ZIP 结构完整性
     
-    使用 zipfile 模块打开输出文件并校验 CRC。
-    成功返回 True，失败抛出异常。
+    使用 zipfile 流式读取每个条目并增量计算 CRC-32, 与中央目录记录的 CRC 比对。
+    分块读取期间通过 callback('verify', read, file_size, ...) 报告进度,
+    避免大文件校验时 UI 假死。成功返回 True，失败抛出 IOError。
     """
     if callback:
         callback('info', 0, 0, '正在验证输出文件完整性...')
-    
+
     try:
         with zipfile.ZipFile(output_path, 'r') as zf:
-            bad_file = zf.testzip()
-            if bad_file is not None:
-                raise IOError(f'CRC 校验失败: {bad_file}')
             names = zf.namelist()
             if not names:
                 raise IOError('ZIP 中无文件条目')
+            for name in names:
+                info = zf.getinfo(name)
+                total = info.file_size
+                if callback and total > 0:
+                    callback('verify', 0, total, f'正在校验 {name}...')
+                crc = 0
+                read = 0
+                try:
+                    with zf.open(name) as fp:
+                        while True:
+                            chunk = fp.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            crc = zlib.crc32(chunk, crc)
+                            read += len(chunk)
+                            if callback and total > 0:
+                                callback('verify', read, total,
+                                        f'正在校验 {name}... '
+                                        f'{format_size(read)} / {format_size(total)}')
+                except (zlib.error, OSError) as e:
+                    raise IOError(f'读取/解压 {name} 失败: {e}')
+                if (crc & 0xFFFFFFFF) != info.CRC:
+                    raise IOError(f'CRC 校验失败: {name}')
     except zipfile.BadZipFile as e:
         raise IOError(f'ZIP 结构损坏: {e}')
-    
+
     if callback:
         callback('info', 0, 0, f'✓ 验证通过 (CRC 正确，包含 {len(names)} 个文件)')
     return True

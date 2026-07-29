@@ -619,7 +619,7 @@ class PolyglotGUI:
         def cb(phase, cur, total, msg):
             if phase in ('start', 'info'):
                 self._log_async(msg, 'info')
-            elif phase in ('compress', 'copy') and total > 0:
+            elif phase in ('compress', 'copy', 'verify') and total > 0:
                 pct = cur * 100 // total
                 self.root.after(0, self._set_progress, pct)
                 self.root.after(0, self._set_status, msg)
