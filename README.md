@@ -18,6 +18,7 @@
 | `polyglot_build.bat` | 启动器 (双模式：有参数走命令行，无参数走 GUI) |
 | `polyglot_build.py` | 核心构建脚本 (GUI / CLI 共用核心逻辑) |
 | `polyglot_gui.py` | 图形界面 (tkinter, Python 标准库) |
+| `test_polyglot.py` | 回归测试 (unittest, 零依赖, `python -m unittest test_polyglot`) |
 
 ## 安装要求
 
@@ -37,15 +38,15 @@
 1. **外层文件** — 点"浏览..."选择伪装用的媒体/文档文件 (`mp4`/`pdf`/`jpg`/`mp3` 等)
 2. **加密 RAR** — 点"浏览..."选择你已用 WinRAR 压缩并设置密码的 `.rar` 文件
 3. **输出文件名** — 可选。点"另存为..."选择保存位置并自定义文件名；留空则与外层文件同名
-4. 点 **"开始构建"**，等待约 1-2 分钟
+4. 点 **"开始构建"**，等待约 1-2 分钟（构建中可点 **"取消"** 中止并自动清理半成品）
 5. 完成后弹窗显示文件路径和大小
 
-进度实时显示在进度条上，日志面板实时输出处理信息。
+进度实时显示在进度条上，日志面板实时输出处理信息。构建与校验阶段均有进度反馈。
 
 ### 方式二: 命令行
 
 ```bash
-polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [--gui] [-q]
+polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 ```
 
 参数说明：
@@ -54,16 +55,23 @@ polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [--gui] [-q]
 |------|------|
 | `外层文件` | 伪装文件路径 (必需, 除非使用 `--gui`) |
 | `加密RAR` | AES-256 加密的 RAR 路径 (必需, 除非使用 `--gui`) |
-| `-o / --output` | 输出文件路径 |
+| `-o / --output` | 输出文件路径 (默认与外层文件同名) |
 | `--gui` | 启动图形界面 |
 | `-q / --quiet` | 静默模式, 不显示进度 |
+| `--deflate` | 使用 Deflate 压缩 (默认 Store 不压缩, RAR 已压缩无需再压) |
+| `--no-verify` | 跳过构建后 ZIP 完整性校验 |
+| `-y / --force` | 强制覆盖已存在的输出文件, 不交互询问 (适合脚本/CI) |
+| `--version` | 显示版本号 |
+| `--gui` | 启动图形界面 |
+
+> Ctrl+C 可随时中止 CLI 构建, 半成品输出会被自动清理。
 
 示例：
 
 ```bash
 python polyglot_build.py video.mp4 game.rar
-python polyglot_build.py photo.jpg secret.rar -o result.jpg
-python polyglot_build.py document.pdf data.rar --output D:\upload\doc.pdf
+python polyglot_build.py photo.jpg secret.rar -o result.jpg --deflate
+python polyglot_build.py document.pdf data.rar --output D:\upload\doc.pdf -y
 polyglot_build.py --gui
 ```
 
@@ -177,9 +185,16 @@ A: 推荐使用 MP4 / PDF / JPEG / BMP / MP3。WebP 不能使用, PNG 和 GIF �
 ## 版本更新记录
 
 ### v3.0 (2026-07-26)
-- **版本号统一**: 运行时代码、GUI、启动器与本文档统一标记为 v3.0，消除历史版本号混乱
-- **测试与质量**: 新增 `test_polyglot.py` (unittest, 零依赖) 守护 ZIP64 数据描述符、临时清理、输出对话框与自动同步; 修复 ZIP64 数据描述符字段顺序与本地头 extra 在 Deflate 下不准确; 临时文件清理改用 `_auto_remove` contextmanager 异常安全
-- **CLI 增强**: 加 `--version` 参数
+- **版本号统一**: 运行时代码、GUI、启动器与本文档统一标记为 v3.0，消除历史版本号混乱 (此前 bat 标 v2.0、本文档标 v2.2)
+- **CLI 增强**: 加 `--version`、`-y/--force` (非交互覆盖, 适合 CI)；Ctrl+C 干净取消并清理半成品 (退出码 130)
+- **GUI 可取消构建**: 新增红色"取消"按钮, 构建中可中止并自动恢复/清理半成品输出；`RoundedButton` 支持自定义悬停/按下色
+- **ZIP64 路径修复**: 修复 `build_zip64_eocd_locator` 格式 (`<IQQ` → `<IIQI`, 此前 >4GB 文件直接崩溃)；分离 `ZIP64_MARKER` 与阈值使 ZIP64 路径可测；本地头 extra 不再误含 offset 字段
+- **ZIP64 数据描述符**: 修复字段顺序 (`<IQQQ` → `<IIQQ`, signature→CRC→compressed→uncompressed)；Deflate 模式下本地头 compressed 传 0 不写未知值
+- **临时文件异常安全**: 清理改用 `_auto_remove` / `_cancel_scope` contextmanager, 构建异常或取消时也清理
+- **流式循环重构**: 抽取 `_stream_copy` 统一 Deflate/Store 两段重复循环
+- **校验进度**: `verify_polyglot` 改为分块流式 CRC 校验, 大文件校验时不再 UI 假死
+- **类型注解**: 核心函数补充类型注解 (基于 `from __future__ import annotations`)
+- **测试与质量**: 新增 `test_polyglot.py` (unittest, 零依赖, 28 用例) 守护数据描述符/端到端轮转/ZIP64 边界/取消/CLI/verify 正负/输出对话框/自动同步；测试即发现并修复了两个 ZIP64 真实 bug
 - **仓库规范**: 新增 `.gitignore` (排除 `__pycache__/` `*.pyc` 等) 与 `LICENSE` (MIT)
 
 ### v2.2 (2026-07-26)
