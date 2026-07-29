@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
+    generate_zip64_extra,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer
@@ -50,6 +51,31 @@ class TestDataDescriptor(unittest.TestCase):
         self.assertEqual(crc32, crc)
         self.assertEqual(comp32, comp)
         self.assertEqual(uncomp32, uncomp)
+
+
+class TestZip64Extra(unittest.TestCase):
+    """守护 A1: ZIP64 extra 字段按需包含, 本地头不误含 offset。"""
+
+    def test_local_header_extra_omits_offset(self):
+        # 本地头 extra 不传 offset (传 0), 故只含 uncompressed + compressed
+        big = ZIP64_SIZE_THRESHOLD + 1
+        extra = generate_zip64_extra(big, big, 0)
+        field_id, data_size = struct.unpack('<HH', extra[:4])
+        self.assertEqual(field_id, 0x0001)
+        self.assertEqual(data_size, 16)  # uncompressed(8) + compressed(8)
+
+    def test_central_dir_extra_includes_offset(self):
+        # 中央目录 extra 传真实 offset, 应额外含 offset 字段
+        big = ZIP64_SIZE_THRESHOLD + 1
+        extra = generate_zip64_extra(big, big, big)
+        _id, data_size = struct.unpack('<HH', extra[:4])
+        self.assertEqual(data_size, 24)  # + offset(8)
+
+    def test_fields_omitted_when_below_threshold(self):
+        # 低于阈值的字段不写入 extra
+        extra = generate_zip64_extra(100, 100, 100)
+        _id, data_size = struct.unpack('<HH', extra[:4])
+        self.assertEqual(data_size, 0)
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -180,6 +206,23 @@ class TestVerify(unittest.TestCase):
     def test_verify_passes_on_valid_polyglot(self):
         out, _ = self._build_valid()
         self.assertTrue(verify_polyglot(out))
+
+    def test_verify_emits_progress_callback(self):
+        # A3: verify 应通过 'verify' 相位发出分块进度
+        out, _ = self._build_valid()
+        phases = []
+
+        def cb(phase, cur, total, msg):
+            phases.append((phase, cur, total))
+
+        verify_polyglot(out, callback=cb)
+        phase_names = [p[0] for p in phases]
+        self.assertIn('info', phase_names)
+        verify_p = [p for p in phases if p[0] == 'verify']
+        self.assertGreater(len(verify_p), 0)
+        # 最后一个 verify 进度应达到 total
+        last = verify_p[-1]
+        self.assertEqual(last[1], last[2])
 
     def test_verify_raises_on_corrupted_data(self):
         out, _ = self._build_valid()
