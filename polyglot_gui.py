@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import queue
+import struct
 
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
@@ -29,6 +30,78 @@ except ImportError:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
                                 COMP_STORED, COMP_DEFLATE, VERSION,
                                 BuildCancelled)
+
+
+# ============================================================
+# 文件拖拽支持 (Windows WM_DROPFILES, 零外部依赖)
+# ============================================================
+# 仅 Windows 原生支持; 其他平台静默降级为无拖拽。
+_DROP_ENABLED = False
+try:
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+
+        _GWL_WNDPROC = -4
+        _WM_DROPFILES = 0x0233
+        _DragAcceptFiles = ctypes.windll.shell32.DragAcceptFiles
+        _DragQueryFileW = ctypes.windll.shell32.DragQueryFileW
+        _DragFinish = ctypes.windll.shell32.DragFinish
+        _CallWindowProcW = ctypes.windll.user32.CallWindowProcW
+        _SetWindowLongW = ctypes.windll.user32.SetWindowLongW
+        if hasattr(wintypes, 'LONG_PTR'):
+            _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+                ctypes.c_int, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM)
+        else:
+            _WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_void_p, ctypes.c_void_p)
+        _DROP_ENABLED = True
+except Exception:
+    _DROP_ENABLED = False
+
+
+def _enable_drop(widget, on_drop):
+    """为 tkinter widget 启用文件拖拽。
+
+    on_drop(paths: list[str]) -> None 在拖入文件释放时被调用,
+    paths 为去重后的绝对路径列表 (保留释放顺序)。
+    仅 Windows 生效; 其他平台为 no-op。
+    """
+    if not _DROP_ENABLED:
+        return
+    widget.update_idletasks()
+    hwnd = ctypes.windll.user32.GetParent(widget.winfo_id())
+
+    # 保留旧 wndproc 引用, 避免被 GC
+    state = {'prev': None}
+
+    def _new_wndproc(hwnd, msg, wparam, lparam):
+        if msg == _WM_DROPFILES:
+            hdrop = wparam
+            # 查询文件数
+            count = _DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+            paths = []
+            for i in range(count):
+                length = _DragQueryFileW(hdrop, i, None, 0)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                _DragQueryFileW(hdrop, i, buf, length + 1)
+                p = buf.value
+                if p and p not in paths:
+                    paths.append(p)
+            _DragFinish(hdrop)
+            if paths:
+                # 在 Tk 主线程安全地回调
+                widget.after(0, lambda: on_drop(paths))
+            return 0
+        return _CallWindowProcW(state['prev'], hwnd, msg, wparam, lparam)
+
+    proc = _WNDPROC_TYPE(_new_wndproc)
+    state['prev'] = _SetWindowLongW(hwnd, _GWL_WNDPROC, proc)
+    # 关键: 把 proc 绑定到 widget 防止 GC
+    widget._drop_proc = proc
+    _DragAcceptFiles(hwnd, True)
 
 
 # ============================================================
@@ -316,6 +389,35 @@ class PolyglotGUI:
         self._setup_styles()
         self._create_widgets()
         self._poll_log_queue()
+
+        # 启用文件拖拽到主窗口 (Windows; 其他平台静默降级)
+        _enable_drop(self.root, self._on_drop)
+
+    # --------------------------------------------------------
+    # 拖拽处理
+    # --------------------------------------------------------
+    def _on_drop(self, paths):
+        """拖入文件释放时回调: 按扩展名智能分配到外层/RAR 槽。
+
+        - .rar -> 加密 RAR 槽
+        - 其他 -> 外层文件槽 (若外层已填则填 RAR 槽)
+        拖入多个时按顺序填充剩余空槽。
+        """
+        if not paths:
+            return
+        assigned_outer = assigned_rar = False
+        for p in paths:
+            ext = os.path.splitext(p)[1].lower()
+            if ext == '.rar' and (not assigned_rar or not self._rar_path.get()):
+                self._rar_path.set(p)
+                assigned_rar = True
+            elif not assigned_outer or not self._outer_path.get():
+                self._outer_path.set(p)
+                assigned_outer = True
+            elif not assigned_rar or not self._rar_path.get():
+                self._rar_path.set(p)
+                assigned_rar = True
+        # _outer_path trace 会自动同步输出路径
 
     # --------------------------------------------------------
     # 样式 (ttk)
@@ -684,8 +786,29 @@ def launch_gui():
         pass
 
     root = tk.Tk()
+    _set_window_icon(root)
     PolyglotGUI(root)
     root.mainloop()
+
+
+def _set_window_icon(root):
+    """为主窗口设置图标 (运行时用 PhotoImage.put 动态绘制像素, 零文件依赖)。
+
+    图标为蓝底 (#007AFF) 白色三层堆叠方块, 寓意 polyglot 多格式拼接。
+    设置失败静默降级为默认图标。
+    """
+    try:
+        size = 32
+        icon = tk.PhotoImage(width=size, height=size)
+        blue = '#007AFF'
+        white = '#FFFFFF'
+        icon.put(blue, to=(0, 0, size, size))
+        for (x, y, w, h) in [(6, 10, 18, 18), (9, 7, 18, 18), (12, 4, 16, 16)]:
+            icon.put(white, to=(x, y, x + w, y + h))
+        root.iconphoto(True, icon)
+        root._app_icon = icon  # 防 GC
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
