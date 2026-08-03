@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
-    generate_zip64_extra,
+    generate_zip64_extra, progress_callback,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer
@@ -470,6 +470,38 @@ class TestCLI(unittest.TestCase):
 
         self.assertEqual(code, 0, err)
         self.assertTrue(os.path.exists(out))
+
+
+class TestProgressCallback(unittest.TestCase):
+    """守护 P0: 非 TTY 下 progress_callback 不打印 \r 进度条 (避免重定向乱码)。"""
+
+    def _run(self, tty):
+        import io
+        from unittest import mock
+
+        class FakeStdout(io.StringIO):
+            def isatty(self):
+                return tty
+
+        buf = FakeStdout()
+        with mock.patch('sys.stdout', buf):
+            progress_callback('compress', 50, 100, '进度测试')
+            progress_callback('done', 100, 100, '完成')
+        return buf.getvalue()
+
+    def test_non_tty_no_carriage_return(self):
+        out = self._run(tty=False)
+        # 非 TTY: 不打印进度条, 无 \r; 仅 info/done 正常输出
+        self.assertNotIn('\r', out)
+        self.assertIn('完成', out)
+        self.assertNotIn('[', out)  # 无进度条方块
+
+    def test_tty_emits_progress_bar(self):
+        out = self._run(tty=True)
+        # TTY: 打印进度条 (含 \r 与 [ 和 █ 块字符)
+        self.assertIn('\r', out)
+        self.assertIn('[', out)
+        self.assertIn('█', out)
 
 
 if __name__ == '__main__':
