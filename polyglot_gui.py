@@ -125,17 +125,50 @@ C_LOG_BG      = '#F0F0F2'   # 日志背景 (浅色系)
 C_LOG_FG      = '#3A3A3C'   # 日志默认文字
 
 # ============================================================
-# 字体常量
+# 字体常量 (跨平台回退)
 # ============================================================
-FONT_TITLE   = ('Segoe UI Semibold', 17)
-FONT_SECTION = ('Segoe UI Semibold', 10)
-FONT_LABEL   = ('Segoe UI', 9)
-FONT_ENTRY   = ('Segoe UI', 10)
-FONT_BTN     = ('Segoe UI Semibold', 11)
-FONT_BROWSE  = ('Segoe UI', 9)
-FONT_MONO    = ('Consolas', 10)
-FONT_HINT    = ('Segoe UI', 9)
-FONT_STATUS  = ('Consolas', 9)
+# 优先使用 Segoe UI / Consolas (Windows), 其他平台自动回退到系统默认字体。
+# 字体族在运行时经 _resolve_fonts() 检测后覆写, 见 PolyglotGUI.__init__。
+_FONT_UI    = 'Segoe UI'      # 界面字体
+_FONT_MONO  = 'Consolas'      # 等宽字体
+FONT_TITLE   = (_FONT_UI + ' Semibold', 17)
+FONT_SECTION = (_FONT_UI + ' Semibold', 10)
+FONT_LABEL   = (_FONT_UI, 9)
+FONT_ENTRY   = (_FONT_UI, 10)
+FONT_BTN     = (_FONT_UI + ' Semibold', 11)
+FONT_BROWSE  = (_FONT_UI, 9)
+FONT_MONO    = (_FONT_MONO, 10)
+FONT_HINT    = (_FONT_UI, 9)
+FONT_STATUS  = (_FONT_MONO, 9)
+
+
+def _resolve_fonts(root):
+    """根据当前平台可用字体覆写全局 FONT_* 常量。
+
+    在 Tk 根窗口创建后调用。若 Segoe UI / Consolas 不存在
+    (如 Linux/macOS), 回退到系统默认字体族 (TkDefaultFont 族)。
+    """
+    global FONT_TITLE, FONT_SECTION, FONT_LABEL, FONT_ENTRY, FONT_BTN
+    global FONT_BROWSE, FONT_MONO, FONT_HINT, FONT_STATUS
+
+    try:
+        from tkinter import font as tkfont
+        families = set(tkfont.families(root))
+    except Exception:
+        return  # 无法检测, 保留默认
+
+    ui_family = _FONT_UI if _FONT_UI in families else 'TkDefaultFont'
+    mono_family = _FONT_MONO if _FONT_MONO in families else 'TkFixedFont'
+
+    FONT_TITLE   = (ui_family + ' Semibold', 17)
+    FONT_SECTION = (ui_family + ' Semibold', 10)
+    FONT_LABEL   = (ui_family, 9)
+    FONT_ENTRY   = (ui_family, 10)
+    FONT_BTN     = (ui_family + ' Semibold', 11)
+    FONT_BROWSE  = (ui_family, 9)
+    FONT_MONO    = (mono_family, 10)
+    FONT_HINT    = (ui_family, 9)
+    FONT_STATUS  = (mono_family, 9)
 
 
 # ============================================================
@@ -386,6 +419,9 @@ class PolyglotGUI:
         self.log_queue = queue.Queue()
         self._stop_event = threading.Event()
 
+        # 检测并应用跨平台字体回退 (须在创建任何控件前)
+        _resolve_fonts(root)
+
         self._setup_styles()
         self._create_widgets()
         self._poll_log_queue()
@@ -549,7 +585,8 @@ class PolyglotGUI:
         log_bar = tk.Frame(log_outer, bg='#E8E8ED', height=28)
         log_bar.grid(row=0, column=0, columnspan=2, sticky='ew')
         log_bar.grid_propagate(False)
-        tk.Label(log_bar, text='  输出日志', font=('Segoe UI', 9, 'bold'),
+        tk.Label(log_bar, text='  输出日志',
+                 font=(FONT_LABEL[0], 9, 'bold'),
                  bg='#E8E8ED', fg=C_TEXT_SEC, anchor='w').pack(
             side=tk.LEFT, padx=(8, 0), pady=(4, 0)
         )

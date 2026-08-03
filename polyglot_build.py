@@ -651,15 +651,19 @@ def verify_polyglot(output_path: str,
 
 
 def progress_callback(phase: str, current: int, total: int, message: str) -> None:
-    """简单的命令行进度回调"""
+    """简单的命令行进度回调。
+
+    在交互式终端 (TTY) 用 \r 刷新进度条; 输出被重定向到文件/管道 (非 TTY)
+    时抑制进度条, 避免产生 \r 乱码, 仅打印阶段信息。
+    """
     if phase == 'start':
         print(f'  {message}')
     elif phase == 'info':
         print(f'  {message}')
     elif phase == 'done':
         print(f'  ✓ {message}')
-    else:
-        # 进度条
+    elif sys.stdout.isatty():
+        # 仅交互式终端显示动态进度条
         if total > 0:
             bar_width = 40
             filled = int(bar_width * current / total)
@@ -668,9 +672,9 @@ def progress_callback(phase: str, current: int, total: int, message: str) -> Non
             print(f'  [{bar}] {percent}%  {message}', end='\r')
         else:
             print(f'  {message}', end='\r')
-    
-    # 完成时换行
-    if phase in ('compress', 'copy') and current >= total:
+
+    # 完成时换行 (仅 TTY 需要; 非 TTY 未打印进度条)
+    if sys.stdout.isatty() and phase in ('compress', 'copy') and current >= total:
         print()  # 换行
 
 
