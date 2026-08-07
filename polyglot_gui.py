@@ -684,9 +684,11 @@ class PolyglotGUI:
         # 外层文件变化时自动填充输出路径
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
-        # === 选项行 ===
+        # === 选项行 (Deflate 压缩 + 表面视频压缩 + 档位) ===
+        # 全部放 column=0 的同一行, 用 pack 在 opt_frame 内横向排列,
+        # 避免开第二列争抢窗口宽度导致列 0 (标题/卡片/按钮) 被挤压。
         opt_frame = ttk.Frame(main)
-        opt_frame.grid(row=2, column=0, sticky='w', pady=(0, 10))
+        opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
         self._deflate_var = tk.BooleanVar(value=False)
         deflate_cb = ttk.Checkbutton(
             opt_frame, text='Deflate 压缩 (默认不压缩，RAR 已压缩无需再压)',
@@ -694,12 +696,9 @@ class PolyglotGUI:
         )
         deflate_cb.pack(side=tk.LEFT, padx=(0, 16))
 
-        # === 表面视频压缩 (隐蔽性优化) ===
-        compress_frame = ttk.Frame(main)
-        compress_frame.grid(row=2, column=1, sticky='w', pady=(0, 10))
         self._compress_var = tk.BooleanVar(value=False)
         compress_cb = ttk.Checkbutton(
-            compress_frame, text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
+            opt_frame, text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
             variable=self._compress_var, command=self._on_compress_toggle
         )
         compress_cb.pack(side=tk.LEFT, padx=(0, 8))
@@ -708,11 +707,10 @@ class PolyglotGUI:
         self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
         quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
         self._quality_combo = ttk.Combobox(
-            compress_frame, state='disabled', width=22,
+            opt_frame, state='disabled', width=22,
             textvariable=self._quality_var, values=quality_labels
         )
         self._quality_combo.pack(side=tk.LEFT)
-        # 用 key 存值, 显示标签
         self._quality_combo.set(quality_labels[0])
         self._quality_labels = quality_labels
 
