@@ -36,6 +36,7 @@ import shutil
 import threading
 import zipfile
 import logging
+import subprocess
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -710,6 +711,114 @@ def progress_callback(phase: str, current: int, total: int, message: str) -> Non
         print()  # 换行
 
 
+# ============================================================
+# 表面视频压缩 (隐蔽性优化: 让"表面视频"体积更合理, 避免与文件大小违和)
+# ============================================================
+# 用长视频做外层隐蔽性最好, 但视频原始体积可能过大。
+# 可选压缩外层视频, 降低最终文件体积。依赖外部 ffmpeg。
+
+# 3 档压缩质量: key -> (码率 bps, 最大高度, 描述)
+VIDEO_QUALITY = {
+    'high':  (3_000_000, 1080, '高 (3Mbps, 1080p)'),
+    'medium': (1_500_000, 720, '中 (1.5Mbps, 720p, 推荐)'),
+    'low':   (800_000, 480, '低 (0.8Mbps, 480p)'),
+}
+DEFAULT_VIDEO_QUALITY = 'medium'
+
+
+def find_ffmpeg() -> Optional[str]:
+    """查找可用的 ffmpeg 可执行文件。
+
+    优先查内置资源目录 (_internal/ffmpeg, 打包时随 exe 分发),
+    再查系统 PATH 中的 ffmpeg。找不到返回 None。
+    """
+    # 内置资源目录 (PyInstaller 单文件模式在 sys._MEIPASS, 普通运行在 _internal)
+    candidate_dirs = []
+    for base in (getattr(sys, '_MEIPASS', None),
+                 os.path.dirname(os.path.abspath(__file__))):
+        if base:
+            candidate_dirs.append(base)
+    for d in candidate_dirs:
+        p = os.path.join(d, 'ffmpeg', 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+        if os.path.isfile(p):
+            return p
+
+    # 回退: 系统 PATH
+    return shutil.which('ffmpeg')
+
+
+def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
+                   callback: Optional[ProgressCallback] = None,
+                   stop_event: Optional[threading.Event] = None) -> str:
+    """用 ffmpeg 压缩视频, 返回压缩后文件路径 dst。
+
+    quality 取值见 VIDEO_QUALITY。ffmpeg 未安装时抛 OSError。
+    通过 callback('info', ...) 报告阶段信息。
+    """
+    if quality not in VIDEO_QUALITY:
+        raise ValueError(f'未知压缩档位: {quality} (可选 {list(VIDEO_QUALITY)})')
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise OSError(
+            '未找到 ffmpeg。请安装 ffmpeg 并加入 PATH, '
+            '或使用打包版 (已内置 ffmpeg)。')
+
+    bitrate, max_height, _label = VIDEO_QUALITY[quality]
+    if callback:
+        callback('info', 0, 0,
+                 f'正在压缩表面视频 ({quality}, {bitrate // 1000}kbps)...')
+
+    # 滤镜: 仅当原始高度高于 max_height 时按比例缩到该高度, 否则保持原尺寸
+    # scale 宽: 高>max_height 时按比例(-2 保持偶数), 否则保持原宽(iw)
+    vf = (f"scale='if(gt(ih\\,{max_height})\\,trunc(iw*{max_height}/ih/2)*2\\,iw)':"
+          f"'if(gt(ih\\,{max_height})\\,{max_height}\\,ih)'")
+
+    cmd = [
+        ffmpeg, '-y', '-i', src,
+        '-c:v', 'libx264', '-preset', 'medium',
+        '-b:v', str(bitrate), '-maxrate', str(int(bitrate * 1.2)),
+        '-bufsize', str(int(bitrate * 2)), '-vf', vf,
+        '-c:a', 'aac', '-b:a', '128k',
+        '-movflags', '+faststart',
+        dst,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 等待完成, 期间检查取消
+        while proc.poll() is None:
+            if stop_event is not None and stop_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+                raise BuildCancelled('压缩已被用户取消')
+            time.sleep(0.1)
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().decode('utf-8', 'ignore') if proc.stderr else ''
+            raise OSError(f'ffmpeg 压缩失败 (退出码 {proc.returncode}):\n{stderr[-500:]}')
+    except BuildCancelled:
+        raise
+    except OSError:
+        raise
+    except Exception as e:
+        raise OSError(f'ffmpeg 执行失败: {e}')
+
+    if callback:
+        callback('info', 0, 0, '表面视频压缩完成')
+    return dst
+
+
+def _temp_path_for_outer(outer_path: str) -> str:
+    """为压缩外层生成临时输出路径 (与源同目录, 前缀 polyglot_compressed_)。"""
+    d = os.path.dirname(os.path.abspath(outer_path))
+    base = os.path.splitext(os.path.basename(outer_path))[0]
+    return os.path.join(d, f'polyglot_compressed_{base}.mp4')
+
+
 def main() -> None:
     """主函数 - 解析命令行参数并执行构建"""
     parser = argparse.ArgumentParser(
@@ -761,7 +870,18 @@ def main() -> None:
         action='store_true',
         help='强制覆盖已存在的输出文件, 不交互询问 (适合脚本/CI)'
     )
-    
+
+    parser.add_argument(
+        '--compress',
+        nargs='?',
+        const=DEFAULT_VIDEO_QUALITY,
+        choices=list(VIDEO_QUALITY),
+        metavar='QUALITY',
+        help='压缩外层视频以减小最终文件体积 (提高隐蔽性)。'
+             f'QUALITY: {", ".join(VIDEO_QUALITY)} (默认 {DEFAULT_VIDEO_QUALITY})。'
+             '需安装 ffmpeg 或使用打包版'
+    )
+
     parser.add_argument(
         '--gui',
         action='store_true',
@@ -841,8 +961,17 @@ def main() -> None:
     
     # 确定压缩方法
     method = COMP_DEFLATE if args.deflate else COMP_STORED
-    
+
+    # 表面视频压缩: 先压缩外层, 再用压缩产物拼接
+    effective_outer: str = args.outer_file
+    compressed_outer: Optional[str] = None
     try:
+        if args.compress:
+            compressed_outer = _temp_path_for_outer(args.outer_file)
+            compress_video(args.outer_file, compressed_outer,
+                           quality=args.compress, callback=callback)
+            effective_outer = compressed_outer
+
         # 开始构建
         logger.info('Polyglot Builder v%s', VERSION)
         logger.info('=' * 40)
@@ -852,7 +981,7 @@ def main() -> None:
             callback('start', 0, 0, f'RAR 文件: {args.rar_file}')
             callback('start', 0, 0, f'输出文件: {output_path}')
 
-        build_polyglot(args.outer_file, args.rar_file, output_path, callback, method=method)
+        build_polyglot(effective_outer, args.rar_file, output_path, callback, method=method)
 
         # 构建后验证
         if not args.no_verify:
@@ -865,13 +994,35 @@ def main() -> None:
         logger.info('  2. 改后缀名为 .zip → 用 WinRAR/7-Zip 打开')
         logger.info('  3. 解压后得到 RAR 文件 → 输入密码解压')
 
+        # 清理压缩外层临时文件
+        if compressed_outer and os.path.exists(compressed_outer):
+            try:
+                os.remove(compressed_outer)
+            except OSError:
+                pass
+
     except KeyboardInterrupt:
+        if compressed_outer and os.path.exists(compressed_outer):
+            try:
+                os.remove(compressed_outer)
+            except OSError:
+                pass
         print('\n已取消 (Ctrl+C), 已清理半成品输出', file=sys.stderr)
         sys.exit(130)
     except BuildCancelled:
+        if compressed_outer and os.path.exists(compressed_outer):
+            try:
+                os.remove(compressed_outer)
+            except OSError:
+                pass
         print('\n已取消, 已清理半成品输出', file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        if compressed_outer and os.path.exists(compressed_outer):
+            try:
+                os.remove(compressed_outer)
+            except OSError:
+                pass
         print(f'错误: {e}', file=sys.stderr)
         sys.exit(1)
 
