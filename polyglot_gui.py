@@ -830,20 +830,111 @@ def launch_gui():
     root.mainloop()
 
 
+def _draw_icon_pixels(img, size):
+    """在 tk.PhotoImage img (size x size) 上绘制应用图标。
+
+    设计: 深蓝渐变圆角底 + 三层错位白色拼接块 (表达多格式层叠拼接)
+          + 右下角黄色迷你锁 (表达内层 AES-256 加密)。
+    """
+    # 颜色 (RGB)
+    BG_TOP = (0x1E, 0x88, 0xE5)      # 浅蓝
+    BG_BOT = (0x0D, 0x47, 0xA1)      # 深蓝
+    WHITE = (0xFF, 0xFF, 0xFF)
+    LAYER_MID = (0xBD, 0xDE, 0xFB)   # 顶层媒体占位淡蓝
+    LOCK = (0xFF, 0xC1, 0x07)        # 金黄
+    LOCK_DARK = (0x0D, 0x47, 0xA1)   # 锁孔深蓝
+
+    def hexcolor(rgb):
+        return '#%02X%02X%02X' % rgb
+
+    def bg_at(y):
+        t = y / size
+        return (int(BG_TOP[0] + (BG_BOT[0] - BG_TOP[0]) * t),
+                int(BG_TOP[1] + (BG_BOT[1] - BG_TOP[1]) * t),
+                int(BG_TOP[2] + (BG_BOT[2] - BG_TOP[2]) * t))
+
+    def blend(fg, bg, a):
+        return tuple(int(fg[i] * a + bg[i] * (1 - a)) for i in range(3))
+
+    # 圆角方块外框半径
+    R = size * 0.18
+
+    def inside_rounded(x, y):
+        if x < R and y < R:
+            return (x - R) ** 2 + (y - R) ** 2 <= R * R
+        if x >= size - R and y < R:
+            return (x - (size - R)) ** 2 + (y - R) ** 2 <= R * R
+        if x < R and y >= size - R:
+            return (x - R) ** 2 + (y - (size - R)) ** 2 <= R * R
+        if x >= size - R and y >= size - R:
+            return (x - (size - R)) ** 2 + (y - (size - R)) ** 2 <= R * R
+        return True
+
+    # 背景: 垂直渐变 + 圆角裁剪
+    for y in range(size):
+        col = hexcolor(bg_at(y))
+        for x in range(size):
+            if inside_rounded(x, y):
+                img.put(col, to=(x, y, x + 1, y + 1))
+
+    # 三层错位拼接块 (半透明白, 与背景混合)
+    layers = [
+        (0.30, size * 0.22, size * 0.38, size * 0.68, size * 0.54),
+        (0.55, size * 0.28, size * 0.31, size * 0.74, size * 0.48),
+        (0.95, size * 0.34, size * 0.24, size * 0.80, size * 0.42),
+    ]
+    for alpha, x0, y0, x1, y1 in layers:
+        for yy in range(int(y0), int(y1)):
+            col = hexcolor(blend(WHITE, bg_at(yy), alpha))
+            img.put(col, to=(int(x0), yy, int(x1), yy + 1))
+
+    # 顶层中间: "媒体文件"占位 (淡蓝), 表达外层是视频/图片/文档
+    mx0, my0, mx1, my1 = size * 0.46, size * 0.28, size * 0.72, size * 0.40
+    for yy in range(int(my0), int(my1)):
+        img.put(hexcolor(LAYER_MID), to=(int(mx0), yy, int(mx1), yy + 1))
+
+    # 右下角迷你锁 (金黄), 表达加密
+    lx0, ly0, lx1, ly1 = size * 0.70, size * 0.62, size * 0.86, size * 0.80
+    for yy in range(int(ly0), int(ly1)):
+        img.put(hexcolor(LOCK), to=(int(lx0), yy, int(lx1), yy + 1))
+
+    # 锁梁: U 形 (顶部半圆 + 两侧下行竖线)
+    arc_cx = (lx0 + lx1) / 2
+    arc_r = (lx1 - lx0) / 2 * 0.55
+    arc_top_y = ly0 - arc_r * 2
+    arc_center_y = arc_top_y + arc_r
+    half_sw = max(2, int(size * 0.025)) / 2
+    for yy in range(int(arc_top_y), int(ly0) + 1):
+        for xx in range(int(lx0), int(lx1) + 1):
+            dx = xx - arc_cx
+            if yy < arc_center_y:
+                d = (dx ** 2 + (yy - arc_center_y) ** 2) ** 0.5
+                if abs(d - arc_r) <= half_sw:
+                    img.put(hexcolor(LOCK), to=(xx, yy, xx + 1, yy + 1))
+            else:
+                if abs(abs(dx) - arc_r) <= half_sw:
+                    img.put(hexcolor(LOCK), to=(xx, yy, xx + 1, yy + 1))
+
+    # 锁孔
+    hole = size * 0.025
+    cx = arc_cx
+    cy = (ly0 + ly1) / 2
+    for yy in range(int(cy - hole - 2), int(cy + hole + 2)):
+        for xx in range(int(cx - hole - 2), int(cx + hole + 2)):
+            if (xx - cx) ** 2 + (yy - cy) ** 2 <= hole * hole:
+                img.put(hexcolor(LOCK_DARK), to=(xx, yy, xx + 1, yy + 1))
+
+
 def _set_window_icon(root):
     """为主窗口设置图标 (运行时用 PhotoImage.put 动态绘制像素, 零文件依赖)。
 
-    图标为蓝底 (#007AFF) 白色三层堆叠方块, 寓意 polyglot 多格式拼接。
-    设置失败静默降级为默认图标。
+    图标为深蓝渐变底 + 三层白色错位拼接块 + 右下角黄色锁,
+    寓意多格式拼接与内层加密。设置失败静默降级为默认图标。
     """
     try:
-        size = 32
+        size = 128
         icon = tk.PhotoImage(width=size, height=size)
-        blue = '#007AFF'
-        white = '#FFFFFF'
-        icon.put(blue, to=(0, 0, size, size))
-        for (x, y, w, h) in [(6, 10, 18, 18), (9, 7, 18, 18), (12, 4, 16, 16)]:
-            icon.put(white, to=(x, y, x + w, y + h))
+        _draw_icon_pixels(icon, size)
         root.iconphoto(True, icon)
         root._app_icon = icon  # 防 GC
     except Exception:
