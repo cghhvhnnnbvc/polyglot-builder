@@ -35,6 +35,7 @@ import time
 import shutil
 import threading
 import zipfile
+import logging
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -45,6 +46,37 @@ ProgressCallback = Callable[[str, int, int, str], None]
 # 版本号 (单一来源: GUI / CLI / bat 均需与此保持一致)
 # ============================================================
 VERSION = '3.0'
+
+
+# ============================================================
+# 统一日志层
+# ============================================================
+# CLI 与 GUI 共用同一套日志通道: 模块级 logger + 统一配置入口。
+# CLI 默认输出到 stdout (进度条走 progress_callback 的特化渲染),
+# GUI 可复用该 logger 或直接走自己的 Text 控件。模块内统一用
+# logging.getLogger(__name__) 记录阶段/错误信息, 避免裸 print 散落。
+LOGGER_NAME = 'polyglot_builder'
+
+
+def get_logger() -> logging.Logger:
+    """返回模块统一的 logger。"""
+    return logging.getLogger(LOGGER_NAME)
+
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    """配置全局日志 (幂等)。CLI 与 GUI 共用此入口, 保证输出格式一致。
+
+    默认只在根 logger 挂一个带格式的 StreamHandler (stdout)。
+    """
+    logger = get_logger()
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter('%(message)s'))  # 简洁: 仅消息本身
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    return logger
 
 
 class BuildCancelled(Exception):
@@ -743,7 +775,12 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    
+
+    # 统一日志: CLI 与 GUI 共用
+    level = logging.WARNING if args.quiet else logging.INFO
+    log = setup_logging(level)
+    logger = get_logger()
+
     # 如果使用 --gui 参数，启动图形界面 (在参数验证之前)
     if args.gui:
         try:
@@ -807,27 +844,27 @@ def main() -> None:
     
     try:
         # 开始构建
-        print(f'Polyglot Builder v{VERSION}')
-        print(f'========================================')
-        
+        logger.info('Polyglot Builder v%s', VERSION)
+        logger.info('=' * 40)
+
         if callback:
             callback('start', 0, 0, f'外层文件: {args.outer_file}')
             callback('start', 0, 0, f'RAR 文件: {args.rar_file}')
             callback('start', 0, 0, f'输出文件: {output_path}')
-        
+
         build_polyglot(args.outer_file, args.rar_file, output_path, callback, method=method)
-        
+
         # 构建后验证
         if not args.no_verify:
             verify_polyglot(output_path, callback)
-        
-        print(f'========================================')
-        print(f'完成! 输出文件: {output_path}')
-        print(f'使用方式:')
-        print(f'  1. 直接在播放器/查看器中打开 → 显示外层内容')
-        print(f'  2. 改后缀名为 .zip → 用 WinRAR/7-Zip 打开')
-        print(f'  3. 解压后得到 RAR 文件 → 输入密码解压')
-        
+
+        logger.info('=' * 40)
+        logger.info('完成! 输出文件: %s', output_path)
+        logger.info('使用方式:')
+        logger.info('  1. 直接在播放器/查看器中打开 → 显示外层内容')
+        logger.info('  2. 改后缀名为 .zip → 用 WinRAR/7-Zip 打开')
+        logger.info('  3. 解压后得到 RAR 文件 → 输入密码解压')
+
     except KeyboardInterrupt:
         print('\n已取消 (Ctrl+C), 已清理半成品输出', file=sys.stderr)
         sys.exit(130)
