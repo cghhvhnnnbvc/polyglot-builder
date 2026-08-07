@@ -37,8 +37,10 @@ import threading
 import zipfile
 import logging
 import subprocess
+import urllib.request
+import urllib.error
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 # 进度回调签名: (phase, current, total, message) -> None
 ProgressCallback = Callable[[str, int, int, str], None]
@@ -725,26 +727,142 @@ VIDEO_QUALITY = {
 }
 DEFAULT_VIDEO_QUALITY = 'medium'
 
+# ffmpeg 本地缓存目录 (首次压缩时下载到此, 之后复用)
+# 存放到程序所在目录下的 ffmpeg/ (源码运行=脚本目录, 打包=exe 目录)
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_LOCAL_DIR = os.path.join(_APP_DIR, 'ffmpeg')
+
+# 下载镜像: (名称, zip 下载 URL)。默认官方, 慢时切换国内镜像。
+FFMPEG_MIRRORS = [
+    ('官方 gyan.dev',
+     'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'),
+    ('国内 清华 TUNA',
+     'https://mirrors.tuna.tsinghua.edu.cn/github-release/BtbN/FFmpeg-Builds/'
+     'latest/ffmpeg-master-latest-win64-gpl-shared.zip'),
+    ('国内 中科大 USTC',
+     'https://mirrors.ustc.edu.cn/github-release/BtbN/FFmpeg-Builds/'
+     'latest/ffmpeg-master-latest-win64-gpl-shared.zip'),
+]
+DEFAULT_MIRROR_INDEX = 0
+
+
+def _local_ffmpeg() -> Optional[str]:
+    """返回本地缓存目录中已存在的 ffmpeg.exe 路径, 无则 None。"""
+    exe = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+    # 直接位于 ffmpeg/ 下
+    p = os.path.join(FFMPEG_LOCAL_DIR, exe)
+    if os.path.isfile(p):
+        return p
+    # 解压后可能在 ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin/ 下
+    for root, _dirs, files in os.walk(FFMPEG_LOCAL_DIR):
+        if exe in files:
+            return os.path.join(root, exe)
+    return None
+
 
 def find_ffmpeg() -> Optional[str]:
     """查找可用的 ffmpeg 可执行文件。
 
-    优先查内置资源目录 (_internal/ffmpeg, 打包时随 exe 分发),
-    再查系统 PATH 中的 ffmpeg。找不到返回 None。
+    优先查本地缓存目录 (ffmpeg/, 首次压缩时下载到此处),
+    再查内置资源目录 (sys._MEIPASS, 打包时随 exe 分发),
+    最后回退系统 PATH。找不到返回 None。
     """
-    # 内置资源目录 (PyInstaller 单文件模式在 sys._MEIPASS, 普通运行在 _internal)
-    candidate_dirs = []
-    for base in (getattr(sys, '_MEIPASS', None),
-                 os.path.dirname(os.path.abspath(__file__))):
-        if base:
-            candidate_dirs.append(base)
-    for d in candidate_dirs:
-        p = os.path.join(d, 'ffmpeg', 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
-        if os.path.isfile(p):
-            return p
+    # 1. 本地缓存 (按需下载)
+    local = _local_ffmpeg()
+    if local:
+        return local
 
-    # 回退: 系统 PATH
+    # 2. 内置资源目录 (PyInstaller)
+    for base in (getattr(sys, '_MEIPASS', None), _APP_DIR):
+        if base:
+            p = os.path.join(base, 'ffmpeg', 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+            if os.path.isfile(p):
+                return p
+
+    # 3. 系统 PATH
     return shutil.which('ffmpeg')
+
+
+def ensure_ffmpeg() -> Optional[str]:
+    """确保 ffmpeg 可用。已安装则返回其路径, 否则返回 None (需下载)。
+
+    与 find_ffmpeg 的区别: ensure_ffmpeg 不主动下载, 只负责检测;
+    调用方据此决定是否提示用户下载。
+    """
+    return find_ffmpeg()
+
+
+def download_ffmpeg(dest_dir: Optional[str] = None,
+                    mirror_index: int = DEFAULT_MIRROR_INDEX,
+                    callback: Optional[ProgressCallback] = None,
+                    stop_event: Optional[threading.Event] = None) -> str:
+    """从指定镜像下载 ffmpeg 并解压到 dest_dir (默认 FFMPEG_LOCAL_DIR)。
+
+    返回下载后 ffmpeg.exe 的路径。下载失败抛 OSError。
+    通过 callback('info'/'download', ...) 报告进度。
+    """
+    if os.name != 'nt':
+        raise OSError('当前仅支持在 Windows 上自动下载 ffmpeg。'
+                      '其他平台请自行安装 ffmpeg 并加入 PATH。')
+
+    dest = dest_dir or FFMPEG_LOCAL_DIR
+    os.makedirs(dest, exist_ok=True)
+    if mirror_index < 0 or mirror_index >= len(FFMPEG_MIRRORS):
+        raise ValueError(f'镜像索引越界: {mirror_index} (可选 0-{len(FFMPEG_MIRRORS) - 1})')
+
+    name, url = FFMPEG_MIRRORS[mirror_index]
+    zip_path = os.path.join(dest, 'ffmpeg_download.zip')
+
+    if callback:
+        callback('info', 0, 0, f'正在从 [{name}] 下载 ffmpeg...')
+
+    def _report(cur, total):
+        if callback and total > 0:
+            callback('download', cur, total,
+                     f'下载 ffmpeg... {format_size(cur)} / {format_size(total)}')
+
+    try:
+        # 流式下载, 支持进度与取消
+        req = urllib.request.Request(url, headers={'User-Agent': 'polyglot-builder'})
+        with urllib.request.urlopen(req) as resp:
+            total = int(resp.headers.get('Content-Length') or 0)
+            done = 0
+            with open(zip_path, 'wb') as f:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        raise BuildCancelled('ffmpeg 下载已被取消')
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    _report(done, total)
+    except urllib.error.URLError as e:
+        raise OSError(f'从 [{name}] 下载 ffmpeg 失败: {e}')
+    except BuildCancelled:
+        raise
+    except Exception as e:
+        raise OSError(f'下载 ffmpeg 失败: {e}')
+
+    # 解压
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(dest)
+    except Exception as e:
+        raise OSError(f'解压 ffmpeg 失败: {e}')
+    finally:
+        if os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+    ffmpeg = _local_ffmpeg()
+    if not ffmpeg:
+        raise OSError('下载完成但未找到 ffmpeg.exe, 请手动解压检查。')
+    if callback:
+        callback('info', 0, 0, 'ffmpeg 下载并安装完成')
+    return ffmpeg
 
 
 def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
