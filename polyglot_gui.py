@@ -20,6 +20,7 @@ import sys
 import time
 import queue
 import struct
+from typing import Optional
 
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
@@ -222,7 +223,8 @@ class RoundedButton(tk.Canvas):
         color = C_DISABLED if not self._enabled else self._bg
         self._draw(color)
 
-    def configure(self, **kw):
+    def configure(self, **kw):  # type: ignore[override]
+        # 重写签名以支持自定义 state/command 处理; 与 tkinter.Canvas 签名不同
         if 'state' in kw:
             self._enabled = kw['state'] != tk.DISABLED
             color = C_DISABLED if not self._enabled else self._bg
@@ -415,8 +417,8 @@ class PolyglotGUI:
         self.root.minsize(760, 600)
         self.root.configure(bg=C_BG)
 
-        self.build_thread = None
-        self.log_queue = queue.Queue()
+        self.build_thread: Optional[threading.Thread] = None
+        self.log_queue: queue.Queue[tuple] = queue.Queue()
         self._stop_event = threading.Event()
 
         # 检测并应用跨平台字体回退 (须在创建任何控件前)
