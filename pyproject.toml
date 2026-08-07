@@ -1,0 +1,17 @@
+[tool.mypy]
+# mypy 2.x 要求 python_version >= 3.10。源码用
+# `from __future__ import annotations` 保持对旧 Python 的运行兼容,
+# 但类型检查以较新版本语法为准。
+python_version = "3.10"
+files = ["polyglot_build.py", "polyglot_gui.py"]
+strict = false
+warn_unused_ignores = true
+check_untyped_defs = true
+no_implicit_optional = true
+# 只检查我们的源码, 不检查依赖 (tkinter/ctypes 等无 stubs)
+ignore_missing_imports = true
+
+# GUI 的 ctypes/wintypes 在非 Windows 可能缺失, 用 per-module 宽松
+[[tool.mypy.overrides]]
+module = ["polyglot_gui"]
+ignore_missing_imports = true
