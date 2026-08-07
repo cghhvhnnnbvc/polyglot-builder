@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +25,9 @@ import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
     generate_zip64_extra, progress_callback,
-    get_logger, setup_logging, compress_video, find_ffmpeg, VIDEO_QUALITY,
+    get_logger, setup_logging, compress_video, find_ffmpeg,
+    download_ffmpeg, FFMPEG_MIRRORS,
+    VIDEO_QUALITY,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer, PolyglotGUI
@@ -550,6 +554,39 @@ class TestVideoCompression(unittest.TestCase):
         self.assertTrue(PolyglotGUI._is_video_ext('MOVIE.MKV'))
         self.assertFalse(PolyglotGUI._is_video_ext('photo.jpg'))
         self.assertFalse(PolyglotGUI._is_video_ext('doc.pdf'))
+
+
+class TestFFmpegDownload(unittest.TestCase):
+    """守护 ffmpeg 按需下载逻辑。"""
+
+    def test_mirrors_defined(self):
+        # 至少 1 个镜像, 每个含 (名称, URL)
+        self.assertGreaterEqual(len(FFMPEG_MIRRORS), 1)
+        for name, url in FFMPEG_MIRRORS:
+            self.assertTrue(name)
+            self.assertTrue(url.startswith('http'))
+
+    def test_invalid_mirror_index_raises(self):
+        with self.assertRaises(ValueError):
+            download_ffmpeg(mirror_index=len(FFMPEG_MIRRORS))
+
+    def test_non_windows_raises(self):
+        # 非 Windows 平台不自动下载
+        from unittest import mock
+        with mock.patch('polyglot_build.os.name', 'posix'):
+            with self.assertRaises(OSError):
+                download_ffmpeg()
+
+    def test_download_error_propagates(self):
+        # 模拟 urllib 下载抛 URLError -> 转 OSError
+        from unittest import mock
+        tmp = tempfile.mkdtemp(prefix='ffmpeg_dl_')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch('polyglot_build.os.name', 'nt'), \
+                mock.patch('urllib.request.urlopen',
+                           side_effect=urllib.error.URLError('net down')):
+            with self.assertRaises(OSError):
+                download_ffmpeg(dest_dir=tmp)
 
 
 if __name__ == '__main__':
