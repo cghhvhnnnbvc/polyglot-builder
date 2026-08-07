@@ -23,10 +23,10 @@ import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
     generate_zip64_extra, progress_callback,
-    get_logger, setup_logging,
+    get_logger, setup_logging, compress_video, find_ffmpeg, VIDEO_QUALITY,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
-from polyglot_gui import get_output_save_options, _should_follow_outer
+from polyglot_gui import get_output_save_options, _should_follow_outer, PolyglotGUI
 
 
 class TestDataDescriptor(unittest.TestCase):
@@ -522,6 +522,34 @@ class TestLogging(unittest.TestCase):
         # 多次 setup 不应重复挂 handler
         self.assertEqual(len(logger.handlers), 1)
         self.assertEqual(logger.level, logging.INFO)
+
+
+class TestVideoCompression(unittest.TestCase):
+    """守护视频压缩: 档位、无 ffmpeg 时抛错、视频扩展名判断。"""
+
+    def test_quality_tiers_defined(self):
+        # 3 档质量 (high/medium/low) 各有码率与分辨率
+        self.assertEqual(set(VIDEO_QUALITY), {'high', 'medium', 'low'})
+        for key, (bitrate, max_h, _label) in VIDEO_QUALITY.items():
+            self.assertGreater(bitrate, 0)
+            self.assertGreater(max_h, 0)
+
+    def test_invalid_quality_raises(self):
+        with self.assertRaises(ValueError):
+            compress_video('x.mp4', 'y.mp4', quality='bogus')
+
+    def test_compress_video_raises_when_ffmpeg_missing(self):
+        # mock find_ffmpeg 返回 None, 应抛 OSError
+        from unittest import mock
+        with mock.patch('polyglot_build.find_ffmpeg', return_value=None):
+            with self.assertRaises(OSError):
+                compress_video('x.mp4', 'y.mp4')
+
+    def test_is_video_ext(self):
+        self.assertTrue(PolyglotGUI._is_video_ext('a.mp4'))
+        self.assertTrue(PolyglotGUI._is_video_ext('MOVIE.MKV'))
+        self.assertFalse(PolyglotGUI._is_video_ext('photo.jpg'))
+        self.assertFalse(PolyglotGUI._is_video_ext('doc.pdf'))
 
 
 if __name__ == '__main__':
