@@ -589,5 +589,80 @@ class TestFFmpegDownload(unittest.TestCase):
                 download_ffmpeg(dest_dir=tmp)
 
 
+class TestGuiLayout(unittest.TestCase):
+    """守护 GUI 布局: 防止列争抢宽度导致标题/卡片/按钮被挤压错乱。
+
+    复现 2026-08-08 反馈: compress_frame 在 column=1 时撑爆窗口,
+    把标题 (被裁切为 'Polyglc') / 文件选择卡片 (被压成窄列) /
+    按钮 (被'取消'覆盖) 全挤压错乱。修复后 compress_frame 合并到
+    opt_frame (column=0), 全部用 pack 横向排布, 不再争列宽度。
+    """
+
+    def _build_gui(self):
+        import tkinter as tk
+        root = tk.Tk()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        root.update()  # 强制传播几何信息
+        return root, gui
+
+    def _iter_descendants(self, widget):
+        """深度优先迭代 widget 的所有后代控件。"""
+        stack = list(widget.winfo_children())
+        while stack:
+            w = stack.pop()
+            yield w
+            stack.extend(w.winfo_children())
+
+    def test_root_window_normal_width(self):
+        # 根窗口宽度应在 880 附近 (之前被压缩列撑爆后变小或被错误几何拉伸)
+        root, _ = self._build_gui()
+        self.assertGreater(root.winfo_width(), 800)
+
+    def test_no_child_overflows_root_width(self):
+        # 任何子控件宽度不应超过根窗口宽度 (防止某列撑爆)
+        root, _ = self._build_gui()
+        root_w = root.winfo_width()
+        for w in self._iter_descendants(root):
+            cw = w.winfo_width()
+            # 允许 1px 误差
+            self.assertLessEqual(cw, root_w,
+                                 f'控件 {w} 宽度 {cw} 超过根窗口 {root_w}')
+
+    def test_card_frame_wide_enough(self):
+        # 文件选择卡片宽度应 > 根窗口的 80% (之前被压到约 60px)
+        root, _ = self._build_gui()
+        root_w = root.winfo_width()
+        card = None
+        for w in self._iter_descendants(root):
+            try:
+                bg = str(w.cget('bg'))
+            except Exception:
+                continue
+            # 文件卡片背景为 C_CARD (#FFFFFF)
+            if bg == '#FFFFFF':
+                card = w
+                break
+        self.assertIsNotNone(card, '未找到文件选择卡片')
+        self.assertGreater(card.winfo_width(), int(root_w * 0.8),
+                           f'文件卡片宽度 {card.winfo_width()} 过窄 (窗口 {root_w})')
+
+    def test_title_not_truncated(self):
+        # 标题 'Polyglot Builder' 的宽度应 > 100px (之前被裁切为 'Polyglc')
+        root, _ = self._build_gui()
+        title = None
+        for w in self._iter_descendants(root):
+            try:
+                if w.cget('text') == 'Polyglot Builder':
+                    title = w
+                    break
+            except Exception:
+                continue
+        self.assertIsNotNone(title, '未找到标题')
+        self.assertGreater(title.winfo_width(), 100,
+                           f'标题被裁切: 宽度仅 {title.winfo_width()}')
+
+
 if __name__ == '__main__':
     unittest.main()
