@@ -26,12 +26,14 @@ try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
                                 COMP_STORED, COMP_DEFLATE, VERSION,
                                 BuildCancelled, compress_video, find_ffmpeg,
+                                download_ffmpeg, FFMPEG_MIRRORS,
                                 VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY)
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
                                 COMP_STORED, COMP_DEFLATE, VERSION,
                                 BuildCancelled, compress_video, find_ffmpeg,
+                                download_ffmpeg, FFMPEG_MIRRORS,
                                 VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY)
 
 
@@ -437,19 +439,140 @@ class PolyglotGUI:
     # 表面视频压缩
     # --------------------------------------------------------
     def _on_compress_toggle(self):
-        """勾选压缩时启用质量档位下拉; 取消时禁用。"""
+        """勾选压缩时启用质量档位下拉; 取消时禁用。
+
+        若未检测到 ffmpeg, 引导用户联网下载 (或选择取消)。
+        """
         enabled = self._compress_var.get()
-        self._quality_combo.configure(state='readonly' if enabled else 'disabled')
-        if enabled and not find_ffmpeg():
-            messagebox.showwarning(
-                '未找到 ffmpeg',
-                '未检测到 ffmpeg。\n\n'
-                '压缩表面视频需要 ffmpeg:\n'
-                '  · 打包版已内置, 直接可用\n'
-                '  · 源码运行需安装 ffmpeg 并加入 PATH\n\n'
-                '你可以继续构建, 但需自行处理压缩。')
+        if not enabled:
+            self._quality_combo.configure(state='disabled')
+            return
+
+        self._quality_combo.configure(state='readonly')
+        if find_ffmpeg():
+            return  # 已有 ffmpeg, 直接用
+
+        # 无 ffmpeg: 引导下载
+        self._prompt_download_ffmpeg()
+
+    def _prompt_download_ffmpeg(self):
+        """未检测到 ffmpeg 时, 弹出提示框让用户选择下载/取消。"""
+        # 镜像选项文本
+        mirror_names = [name for name, _url in FFMPEG_MIRRORS]
+        result = messagebox.askquestion(
+            '需要 ffmpeg',
+            '未检测到 ffmpeg。\n\n'
+            '压缩表面视频需要 ffmpeg 组件。\n'
+            '是否从网络下载并自动安装？\n\n'
+            f'默认镜像: {mirror_names[0]}\n'
+            '(如下载缓慢可切换国内镜像)\n\n'
+            '点击"否"将取消压缩, 但可继续普通构建。',
+            icon='question')
+        if result != 'yes':
             self._compress_var.set(False)
             self._quality_combo.configure(state='disabled')
+            return
+
+        # 确认下载后, 后台线程下载, 避免阻塞 UI
+        self._download_ffmpeg_async(mirror_index=0)
+
+    def _download_ffmpeg_async(self, mirror_index: int = 0):
+        """在后台线程下载 ffmpeg; 成功/失败后回到主线程处理。"""
+        self._log_async(f'开始下载 ffmpeg (镜像: {FFMPEG_MIRRORS[mirror_index][0]})...',
+                        'info')
+        self.cancel_btn.configure(state=tk.NORMAL)
+
+        def dl():
+            try:
+                download_ffmpeg(mirror_index=mirror_index,
+                                callback=self._ffmpeg_dl_cb)
+                self.root.after(0, self._on_ffmpeg_dl_success)
+            except BuildCancelled:
+                self.root.after(0, self._on_ffmpeg_dl_cancel)
+            except Exception as e:
+                self.root.after(0, self._on_ffmpeg_dl_error, str(e))
+
+        threading.Thread(target=dl, daemon=True).start()
+
+    def _ffmpeg_dl_cb(self, phase, cur, total, msg):
+        if phase == 'info':
+            self._log_async(msg, 'info')
+        elif phase == 'download':
+            pct = cur * 100 // total if total > 0 else 0
+            self.root.after(0, self._set_progress, pct)
+            self.root.after(0, self._set_status, f'下载 ffmpeg... {pct}%')
+
+    def _on_ffmpeg_dl_success(self):
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('ffmpeg 已就绪')
+        self._set_progress(100)
+        self._log_async('ffmpeg 下载并安装完成, 可使用压缩功能。', 'success')
+        messagebox.showinfo('ffmpeg 已安装',
+                            'ffmpeg 下载并安装完成。\n现在可以使用表面视频压缩功能。')
+
+    def _on_ffmpeg_dl_cancel(self):
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('已取消下载')
+        self._set_progress(0)
+        self._compress_var.set(False)
+        self._quality_combo.configure(state='disabled')
+        self._log_async('ffmpeg 下载已取消。', 'warning')
+
+    def _on_ffmpeg_dl_error(self, msg):
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('下载失败')
+        self._set_progress(0)
+        self._compress_var.set(False)
+        self._quality_combo.configure(state='disabled')
+        self._log_async(f'ffmpeg 下载失败: {msg}', 'error')
+        # 提示切换镜像或手动安装
+        retry = messagebox.askyesno(
+            '下载失败',
+            f'ffmpeg 下载失败:\n{msg}\n\n'
+            '是否尝试其他镜像 (国内镜像可能更快)？')
+        if retry:
+            # 依次尝试所有镜像直到成功
+            self._download_ffmpeg_all()
+
+    def _download_ffmpeg_all(self):
+        """依次尝试所有镜像, 直到某个成功或全部失败。"""
+        self._log_async('依次尝试所有镜像下载 ffmpeg...', 'info')
+
+        def dl_all():
+            last_err = '未知错误'
+            for i, (name, _url) in enumerate(FFMPEG_MIRRORS):
+                self.root.after(0, self._log_async, f'尝试镜像 [{name}]...', 'info')
+                try:
+                    download_ffmpeg(mirror_index=i,
+                                    callback=self._ffmpeg_dl_cb)
+                    self.root.after(0, self._on_ffmpeg_dl_success)
+                    return
+                except BuildCancelled:
+                    self.root.after(0, self._on_ffmpeg_dl_cancel)
+                    return
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+            # 全部镜像失败: 静默报错 (不再弹重试框, 避免循环)
+            self._finalize_download_failure(last_err)
+
+        threading.Thread(target=dl_all, daemon=True).start()
+
+    def _finalize_download_failure(self, msg):
+        """下载彻底失败: 恢复 UI, 记录错误并提示手动安装 (不弹重试框)。"""
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('下载失败')
+        self._set_progress(0)
+        self._compress_var.set(False)
+        self._quality_combo.configure(state='disabled')
+        self._log_async(f'ffmpeg 下载失败: {msg}', 'error')
+        messagebox.showwarning(
+            'ffmpeg 下载失败',
+            f'所有镜像均下载失败:\n{msg}\n\n'
+            '请手动安装 ffmpeg:\n'
+            '  1. 从 https://ffmpeg.org/download.html 下载\n'
+            '  2. 将 ffmpeg.exe 放入程序目录的 ffmpeg/ 文件夹\n'
+            '  3. 或安装并加入系统 PATH')
 
     def _selected_quality(self) -> Optional[str]:
         """读取当前选中的质量档位 key (如 'high'/'medium'/'low'), 无效返回 None。"""
