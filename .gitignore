@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 类型检查器缓存
+.mypy_cache/
+.pyright_cache/
+
 # IDE / 工具缓存
 .qoder/
 .codebuddy/
