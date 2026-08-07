@@ -25,12 +25,14 @@ from typing import Optional
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
                                 COMP_STORED, COMP_DEFLATE, VERSION,
-                                BuildCancelled)
+                                BuildCancelled, compress_video, find_ffmpeg,
+                                VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY)
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
                                 COMP_STORED, COMP_DEFLATE, VERSION,
-                                BuildCancelled)
+                                BuildCancelled, compress_video, find_ffmpeg,
+                                VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY)
 
 
 # ============================================================
@@ -432,6 +434,32 @@ class PolyglotGUI:
         _enable_drop(self.root, self._on_drop)
 
     # --------------------------------------------------------
+    # 表面视频压缩
+    # --------------------------------------------------------
+    def _on_compress_toggle(self):
+        """勾选压缩时启用质量档位下拉; 取消时禁用。"""
+        enabled = self._compress_var.get()
+        self._quality_combo.configure(state='readonly' if enabled else 'disabled')
+        if enabled and not find_ffmpeg():
+            messagebox.showwarning(
+                '未找到 ffmpeg',
+                '未检测到 ffmpeg。\n\n'
+                '压缩表面视频需要 ffmpeg:\n'
+                '  · 打包版已内置, 直接可用\n'
+                '  · 源码运行需安装 ffmpeg 并加入 PATH\n\n'
+                '你可以继续构建, 但需自行处理压缩。')
+            self._compress_var.set(False)
+            self._quality_combo.configure(state='disabled')
+
+    def _selected_quality(self) -> Optional[str]:
+        """读取当前选中的质量档位 key (如 'high'/'medium'/'low'), 无效返回 None。"""
+        label = self._quality_combo.get()
+        for k in VIDEO_QUALITY:
+            if label.startswith(f'{k} -'):
+                return k
+        return DEFAULT_VIDEO_QUALITY if self._compress_var.get() else None
+
+    # --------------------------------------------------------
     # 拖拽处理
     # --------------------------------------------------------
     def _on_drop(self, paths):
@@ -541,7 +569,29 @@ class PolyglotGUI:
             opt_frame, text='Deflate 压缩 (默认不压缩，RAR 已压缩无需再压)',
             variable=self._deflate_var
         )
-        deflate_cb.pack(side=tk.LEFT)
+        deflate_cb.pack(side=tk.LEFT, padx=(0, 16))
+
+        # === 表面视频压缩 (隐蔽性优化) ===
+        compress_frame = ttk.Frame(main)
+        compress_frame.grid(row=2, column=1, sticky='w', pady=(0, 10))
+        self._compress_var = tk.BooleanVar(value=False)
+        compress_cb = ttk.Checkbutton(
+            compress_frame, text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
+            variable=self._compress_var, command=self._on_compress_toggle
+        )
+        compress_cb.pack(side=tk.LEFT, padx=(0, 8))
+
+        # 质量档位下拉 (仅勾选时可用)
+        self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
+        quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
+        self._quality_combo = ttk.Combobox(
+            compress_frame, state='disabled', width=22,
+            textvariable=self._quality_var, values=quality_labels
+        )
+        self._quality_combo.pack(side=tk.LEFT)
+        # 用 key 存值, 显示标签
+        self._quality_combo.set(quality_labels[0])
+        self._quality_labels = quality_labels
 
         # === 构建按钮 (Canvas 圆角) ===
         btn_frame = ttk.Frame(main)
@@ -756,6 +806,8 @@ class PolyglotGUI:
 
     def _run(self, outer, rar, out):
         method = COMP_DEFLATE if self._deflate_var.get() else COMP_STORED
+        quality = self._selected_quality()
+        compressed_outer = None
 
         def cb(phase, cur, total, msg):
             if phase in ('start', 'info'):
@@ -770,8 +822,22 @@ class PolyglotGUI:
                 self._log_async(msg, 'success')
 
         try:
-            build_polyglot(outer, rar, out, callback=cb, method=method,
-                           stop_event=self._stop_event)
+            # 若勾选压缩: 先用 ffmpeg 压缩外层视频, 再用压缩产物拼接
+            effective_outer = outer
+            if quality:
+                # 校验外层是视频
+                if not self._is_video_ext(outer):
+                    raise ValueError(
+                        '压缩表面视频仅支持视频外层文件 (mp4/mkv/avi/mov/webm 等)。\n'
+                        '请更换外层为视频, 或取消勾选压缩。')
+                # 压缩到临时路径
+                compressed_outer = self._temp_compressed_path(outer)
+                compress_video(outer, compressed_outer, quality=quality,
+                               callback=cb, stop_event=self._stop_event)
+                effective_outer = compressed_outer
+
+            build_polyglot(effective_outer, rar, out, callback=cb,
+                           method=method, stop_event=self._stop_event)
             verify_polyglot(out, callback=cb)
             self.root.after(0, self._on_success, out)
         except BuildCancelled as e:
@@ -780,6 +846,25 @@ class PolyglotGUI:
         except Exception as e:
             self._log_async(f'构建失败: {e}', 'error')
             self.root.after(0, self._on_error, str(e))
+        finally:
+            # 清理压缩外层临时文件
+            if compressed_outer and os.path.exists(compressed_outer):
+                try:
+                    os.remove(compressed_outer)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _is_video_ext(path: str) -> bool:
+        video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
+        return os.path.splitext(path)[1].lower() in video_exts
+
+    @staticmethod
+    def _temp_compressed_path(outer: str) -> str:
+        """为压缩外层生成临时路径 (同目录, 前缀 polyglot_compressed_)。"""
+        d = os.path.dirname(os.path.abspath(outer))
+        base = os.path.splitext(os.path.basename(outer))[0]
+        return os.path.join(d, f'polyglot_compressed_{base}.mp4')
 
     def _on_success(self, out):
         self.build_btn.configure(state=tk.NORMAL)
