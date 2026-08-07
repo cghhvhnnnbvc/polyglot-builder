@@ -23,6 +23,7 @@ import polyglot_build
 from polyglot_build import (
     build_data_descriptor, build_polyglot, verify_polyglot,
     generate_zip64_extra, progress_callback,
+    get_logger, setup_logging,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
 from polyglot_gui import get_output_save_options, _should_follow_outer
@@ -502,6 +503,25 @@ class TestProgressCallback(unittest.TestCase):
         self.assertIn('\r', out)
         self.assertIn('[', out)
         self.assertIn('█', out)
+
+
+class TestLogging(unittest.TestCase):
+    """守护 P2.2: 统一日志层 get_logger/setup_logging 幂等且可配置。"""
+
+    def test_get_logger_returns_same_singleton(self):
+        import logging
+        self.assertIs(get_logger(), get_logger())
+        self.assertIs(get_logger(),
+                      logging.getLogger(polyglot_build.LOGGER_NAME))
+
+    def test_setup_logging_is_idempotent(self):
+        import logging
+        setup_logging(logging.DEBUG)
+        setup_logging(logging.INFO)
+        logger = get_logger()
+        # 多次 setup 不应重复挂 handler
+        self.assertEqual(len(logger.handlers), 1)
+        self.assertEqual(logger.level, logging.INFO)
 
 
 if __name__ == '__main__':
