@@ -684,30 +684,36 @@ class PolyglotGUI:
         # 外层文件变化时自动填充输出路径
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
-        # === 选项行 (Deflate 压缩 + 表面视频压缩 + 档位) ===
-        # 全部放 column=0 的同一行, 用 pack 在 opt_frame 内横向排列,
-        # 避免开第二列争抢窗口宽度导致列 0 (标题/卡片/按钮) 被挤压。
+        # === 选项区 (Deflate 压缩 / 表面视频压缩 + 档位) ===
+        # 垂直堆叠 (一上一下), 避免横向被窗口挤压/截断
+        # (原并排方案在窗口稍窄时第二行被压到边界, 文本截断)
         opt_frame = ttk.Frame(main)
         opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
+
+        # 第 1 行: Deflate 压缩
         self._deflate_var = tk.BooleanVar(value=False)
         deflate_cb = ttk.Checkbutton(
             opt_frame, text='Deflate 压缩 (默认不压缩，RAR 已压缩无需再压)',
             variable=self._deflate_var
         )
-        deflate_cb.pack(side=tk.LEFT, padx=(0, 16))
+        deflate_cb.pack(anchor='w', pady=(0, 4))
 
+        # 第 2 行: 压缩复选框 + 质量档位下拉 (右对齐, 复选框占左侧)
+        compress_row = ttk.Frame(opt_frame)
+        compress_row.pack(anchor='w', fill='x')
         self._compress_var = tk.BooleanVar(value=False)
         compress_cb = ttk.Checkbutton(
-            opt_frame, text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
+            compress_row,
+            text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
             variable=self._compress_var, command=self._on_compress_toggle
         )
-        compress_cb.pack(side=tk.LEFT, padx=(0, 8))
+        compress_cb.pack(side=tk.LEFT, padx=(0, 12))
 
         # 质量档位下拉 (仅勾选时可用)
         self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
         quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
         self._quality_combo = ttk.Combobox(
-            opt_frame, state='disabled', width=22,
+            compress_row, state='disabled', width=22,
             textvariable=self._quality_var, values=quality_labels
         )
         self._quality_combo.pack(side=tk.LEFT)
