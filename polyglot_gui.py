@@ -358,6 +358,59 @@ class PlaceholderEntry(ttk.Entry):
 
 
 # ============================================================
+# Tooltip (鼠标悬浮提示, 零依赖)
+# ============================================================
+class Tooltip:
+    """为任意 tkinter 控件附加鼠标悬浮提示。
+
+    用法:
+        Tooltip(widget, text='说明文字')
+
+    鼠标移入 (Enter) 延迟约 0.5s 后在光标附近显示一个小黄框,
+    移出 (Leave) 时自动关闭。支持换行文本 (用 \\n)。
+    """
+
+    def __init__(self, widget, text: str, delay_ms: int = 500):
+        self._widget = widget
+        self._text = text
+        self._delay = delay_ms
+        self._tip: Optional[tk.Toplevel] = None
+        self._after_id: Optional[str] = None
+        widget.bind('<Enter>', self._schedule, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+        widget.bind('<ButtonPress>', self._hide, add='+')
+
+    def _schedule(self, _event):
+        self._hide(None)
+        self._after_id = self._widget.after(self._delay, self._show)
+
+    def _show(self):
+        if self._tip is not None:
+            return
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 8
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)   # 无边框窗口
+        self._tip.wm_geometry(f'+{x}+{y}')
+        label = tk.Label(
+            self._tip, text=self._text, justify=tk.LEFT,
+            background='#FFFFE0', foreground='#333333',
+            relief='solid', borderwidth=1,
+            font=('TkDefaultFont', 9),
+            padx=8, pady=6, wraplength=320
+        )
+        label.pack()
+
+    def _hide(self, _event):
+        if self._after_id is not None:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
+# ============================================================
 # 输出文件保存选项 (根据外层扩展名动态生成)
 # ============================================================
 def get_output_save_options(outer_path: str) -> tuple[list[tuple[str, str]], str]:
@@ -441,19 +494,12 @@ class PolyglotGUI:
     def _on_compress_toggle(self):
         """勾选压缩时启用质量档位下拉; 取消时禁用。
 
-        若未检测到 ffmpeg, 引导用户联网下载 (或选择取消)。
+        仅控制下拉框可用性 (勾选即变为可点/readonly), 保证下拉立即可用。
+        ffmpeg 缺失的检测与引导下载延迟到构建时 (_run), 不阻塞本操作。
         """
         enabled = self._compress_var.get()
-        if not enabled:
-            self._quality_combo.configure(state='disabled')
-            return
-
-        self._quality_combo.configure(state='readonly')
-        if find_ffmpeg():
-            return  # 已有 ffmpeg, 直接用
-
-        # 无 ffmpeg: 引导下载
-        self._prompt_download_ffmpeg()
+        self._quality_combo.configure(
+            state='readonly' if enabled else 'disabled')
 
     def _prompt_download_ffmpeg(self):
         """未检测到 ffmpeg 时, 弹出提示框让用户选择下载/取消。"""
@@ -686,30 +732,35 @@ class PolyglotGUI:
 
         # === 选项区 (Deflate 压缩 / 表面视频压缩 + 档位) ===
         # 垂直堆叠 (一上一下), 避免横向被窗口挤压/截断
-        # (原并排方案在窗口稍窄时第二行被压到边界, 文本截断)
         opt_frame = ttk.Frame(main)
         opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
 
-        # 第 1 行: Deflate 压缩
+        # 第 1 行: Deflate 压缩 (简短文本 + 悬浮提示)
         self._deflate_var = tk.BooleanVar(value=False)
         deflate_cb = ttk.Checkbutton(
-            opt_frame, text='Deflate 压缩 (默认不压缩，RAR 已压缩无需再压)',
-            variable=self._deflate_var
+            opt_frame, text='Deflate 压缩', variable=self._deflate_var
         )
         deflate_cb.pack(anchor='w', pady=(0, 4))
+        Tooltip(deflate_cb,
+                '对内部 RAR 数据使用 Deflate 压缩。\n'
+                '默认关闭 (RAR 本身已高度压缩, 再压收益极小且更耗时)。\n'
+                '通常无需开启。')
 
-        # 第 2 行: 压缩复选框 + 质量档位下拉 (右对齐, 复选框占左侧)
+        # 第 2 行: 压缩复选框 + 质量档位下拉 (复选框占左侧, 下拉在右)
         compress_row = ttk.Frame(opt_frame)
         compress_row.pack(anchor='w', fill='x')
         self._compress_var = tk.BooleanVar(value=False)
         compress_cb = ttk.Checkbutton(
-            compress_row,
-            text='压缩表面视频 (减小最终体积, 提高隐蔽性)',
+            compress_row, text='压缩表面视频',
             variable=self._compress_var, command=self._on_compress_toggle
         )
         compress_cb.pack(side=tk.LEFT, padx=(0, 12))
+        Tooltip(compress_cb,
+                '用 ffmpeg 压缩外层视频, 减小最终文件体积, 提高隐蔽性。\n\n'
+                '用长视频做外层并压缩, 可避免"表面是小文件却占用几个 G"\n'
+                '的违和感, 降低被平台判定为异常文件的风险。')
 
-        # 质量档位下拉 (仅勾选时可用)
+        # 质量档位下拉 (仅勾选时启用; 一直保持可点, 未勾选时灰显)
         self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
         quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
         self._quality_combo = ttk.Combobox(
@@ -719,6 +770,12 @@ class PolyglotGUI:
         self._quality_combo.pack(side=tk.LEFT)
         self._quality_combo.set(quality_labels[0])
         self._quality_labels = quality_labels
+        Tooltip(self._quality_combo,
+                '压缩质量档位: 码率越低 / 分辨率越低, 体积越小。\n\n'
+                '· 高: 3Mbps, 1080p (画面清晰, 压缩少)\n'
+                '· 中: 1.5Mbps, 720p (体积与清晰度平衡, 推荐)\n'
+                '· 低: 0.8Mbps, 480p (体积最小, 画面略糊)\n\n'
+                '仅勾选"压缩表面视频"后可用。')
 
         # === 构建按钮 (Canvas 圆角) ===
         btn_frame = ttk.Frame(main)
@@ -957,6 +1014,14 @@ class PolyglotGUI:
                     raise ValueError(
                         '压缩表面视频仅支持视频外层文件 (mp4/mkv/avi/mov/webm 等)。\n'
                         '请更换外层为视频, 或取消勾选压缩。')
+                # 校验 ffmpeg 可用; 缺失则引导下载 (在主线程弹窗, 中断本次构建)
+                if not find_ffmpeg():
+                    self._log_async('未检测到 ffmpeg, 无法压缩表面视频。', 'warning')
+                    self.root.after(0, self._prompt_download_ffmpeg)
+                    self.root.after(0, self._on_error,
+                                    '未检测到 ffmpeg。\n\n'
+                                    '请在弹出窗口中选择下载安装, 安装完成后重新构建。')
+                    return
                 # 压缩到临时路径
                 compressed_outer = self._temp_compressed_path(outer)
                 compress_video(outer, compressed_outer, quality=quality,
