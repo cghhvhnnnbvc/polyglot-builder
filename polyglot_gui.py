@@ -731,27 +731,32 @@ class PolyglotGUI:
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
         # === 选项区 (Deflate 压缩 / 表面视频压缩 + 档位) ===
-        # 垂直堆叠 (一上一下), 避免横向被窗口挤压/截断
+        # 垂直堆叠, 横向填满: 复选框/下拉在左, 右侧淡灰小字提示填满空白
+        # 带 ⓘ 图标提示该控件有悬浮说明
         opt_frame = ttk.Frame(main)
         opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
 
-        # 第 1 行: Deflate 压缩 (简短文本 + 悬浮提示)
+        # 第 1 行: Deflate 压缩 + 右侧提示
+        deflate_row = ttk.Frame(opt_frame)
+        deflate_row.pack(anchor='w', fill='x', pady=(0, 4))
         self._deflate_var = tk.BooleanVar(value=False)
         deflate_cb = ttk.Checkbutton(
-            opt_frame, text='Deflate 压缩', variable=self._deflate_var
+            deflate_row, text='Deflate 压缩 ⓘ', variable=self._deflate_var
         )
-        deflate_cb.pack(anchor='w', pady=(0, 4))
+        deflate_cb.pack(side=tk.LEFT)
         Tooltip(deflate_cb,
                 '对内部 RAR 数据使用 Deflate 压缩。\n'
                 '默认关闭 (RAR 本身已高度压缩, 再压收益极小且更耗时)。\n'
                 '通常无需开启。')
+        tk.Label(deflate_row, text='RAR 已压缩, 通常无需开启',
+                 fg='#888888', font=FONT_HINT).pack(side=tk.RIGHT, padx=(0, 4))
 
-        # 第 2 行: 压缩复选框 + 质量档位下拉 (复选框占左侧, 下拉在右)
+        # 第 2 行: 压缩复选框 + 质量档位下拉 (左) + 右侧提示 (右)
         compress_row = ttk.Frame(opt_frame)
         compress_row.pack(anchor='w', fill='x')
         self._compress_var = tk.BooleanVar(value=False)
         compress_cb = ttk.Checkbutton(
-            compress_row, text='压缩表面视频',
+            compress_row, text='压缩表面视频 ⓘ',
             variable=self._compress_var, command=self._on_compress_toggle
         )
         compress_cb.pack(side=tk.LEFT, padx=(0, 12))
@@ -764,10 +769,10 @@ class PolyglotGUI:
         self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
         quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
         self._quality_combo = ttk.Combobox(
-            compress_row, state='disabled', width=22,
+            compress_row, state='disabled', width=20,
             textvariable=self._quality_var, values=quality_labels
         )
-        self._quality_combo.pack(side=tk.LEFT)
+        self._quality_combo.pack(side=tk.LEFT, padx=(0, 12))
         self._quality_combo.set(quality_labels[0])
         self._quality_labels = quality_labels
         Tooltip(self._quality_combo,
@@ -776,6 +781,10 @@ class PolyglotGUI:
                 '· 中: 1.5Mbps, 720p (体积与清晰度平衡, 推荐)\n'
                 '· 低: 0.8Mbps, 480p (体积最小, 画面略糊)\n\n'
                 '仅勾选"压缩表面视频"后可用。')
+
+        # 第 2 行右侧提示 (压缩后体积更合理, 降低"小文件几个 G"违和)
+        tk.Label(compress_row, text='降低小文件却几个 G 的违和感',
+                 fg='#888888', font=FONT_HINT).pack(side=tk.RIGHT, padx=(0, 4))
 
         # === 构建按钮 (Canvas 圆角) ===
         btn_frame = ttk.Frame(main)
