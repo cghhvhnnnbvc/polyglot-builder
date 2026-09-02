@@ -515,6 +515,27 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0, err)
         fake.launch_gui.assert_called_once()
 
+    def test_cli_no_args_dispatches_to_gui(self):
+        # 无参数 (双击 exe / 直接运行) → 自动进入 GUI 并 sys.exit(0)
+        from unittest import mock
+        import types
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            self.skipTest('tkinter 不可用')
+        fake = types.ModuleType('polyglot_gui')
+        fake.launch_gui = mock.MagicMock()
+        with mock.patch.dict('sys.modules', {'polyglot_gui': fake}):
+            code, _o, err = self._run_main(['polyglot_build.py'])
+        self.assertEqual(code, 0, err)
+        fake.launch_gui.assert_called_once()
+
+    def test_cli_partial_args_still_errors(self):
+        # 只给外层、缺 RAR: 仍按 CLI 校验报错 (parser.error → SystemExit 2), 不误入 GUI
+        code, _o, _err = self._run_main(
+            ['polyglot_build.py', 'only_outer.mp4'])
+        self.assertEqual(code, 2)
+
 
 class TestProgressCallback(unittest.TestCase):
     """守护 P0: 非 TTY 下 progress_callback 不打印 \r 进度条 (避免重定向乱码)。"""

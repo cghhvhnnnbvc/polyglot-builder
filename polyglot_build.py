@@ -1189,6 +1189,23 @@ def _run_batch(args: argparse.Namespace, logger: logging.Logger) -> None:
     sys.exit(0)
 
 
+def _hide_console_window() -> None:
+    """(仅 Windows 打包版) 隐藏随附控制台窗口, 用于双击 exe 直达 GUI。
+
+    以 sys.platform 守卫: 非 Windows 下 mypy 视下方为不可达, 不会因
+    ctypes.windll 缺失而报错 (CI 在 ubuntu 上也跑 mypy)。best-effort, 失败静默。
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # 0 = SW_HIDE
+    except Exception:
+        pass
+
+
 def main() -> None:
     """主函数 - 解析命令行参数并执行构建"""
     parser = argparse.ArgumentParser(
@@ -1284,11 +1301,23 @@ def main() -> None:
     log = setup_logging(level, log_file=args.log_file)
     logger = get_logger()
 
+    # 无参数运行 (双击打包版 exe / 直接运行脚本) → 自动进入 GUI,
+    # 与 polyglot_build.bat 的"双模式"(有参走 CLI, 无参走 GUI) 一致。
+    # 仅在既无位置参数又无 --batch 时回退 GUI; 只给部分位置参数仍按 CLI 报错。
+    bare_launch = (not args.gui and not args.batch
+                   and not args.outer_file and not args.rar_file)
+    if bare_launch:
+        args.gui = True
+
     # 如果使用 --gui 参数，启动图形界面 (在参数验证之前)
     if args.gui:
         try:
             import tkinter as tk
             from polyglot_gui import launch_gui
+            # 打包版被双击 (无参数) 启动时隐藏黑色控制台, 只留 GUI 窗口;
+            # 放在导入成功之后, 保证导入失败时错误仍能显示在控制台。
+            if bare_launch and getattr(sys, 'frozen', False):
+                _hide_console_window()
             launch_gui()
             sys.exit(0)
         except ImportError:

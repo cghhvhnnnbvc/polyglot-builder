@@ -56,8 +56,8 @@ polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 
 | 参数 | 说明 |
 |------|------|
-| `外层文件` | 伪装文件路径 (必需, 除非使用 `--gui`) |
-| `加密RAR` | AES-256 加密的 RAR 路径 (必需, 除非使用 `--gui`) |
+| `外层文件` | 伪装文件路径 (必需, 除非用 `--gui`/`--batch`, 或无参数直接进 GUI) |
+| `加密RAR` | AES-256 加密的 RAR 路径 (必需, 除非用 `--gui`/`--batch`) |
 | `-o / --output` | 输出文件路径 (默认与外层文件同名) |
 | `--gui` | 启动图形界面 |
 | `-q / --quiet` | 静默模式, 不显示进度 |
@@ -211,7 +211,7 @@ pyinstaller --noconfirm polyglot_builder.spec
 
 - 采用 **onedir** 模式 (产物在 `dist/PolyglotBuilder/`), 因 ffmpeg 体积大, onefile 冷启动慢。
 - 若源码目录下存在 `ffmpeg/`, 会被一并打包为**内置资源** (免运行时下载); 否则程序仍会按需下载。
-- 运行: `dist/PolyglotBuilder/PolyglotBuilder.exe --gui`。
+- 运行: **直接双击 `PolyglotBuilder.exe`** (无参数时自动进入 GUI, 并隐藏随附控制台窗口); 或命令行 `PolyglotBuilder.exe --gui`。
 - spec 中 `console=True` 保留控制台以兼容 CLI; 若只发布 GUI, 可改为 `False` 去掉控制台窗口。
 
 持续集成: 仓库含 `.github/workflows/ci.yml`, 在 push/PR 时于 Windows + Ubuntu × Python 3.10/3.12 矩阵自动跑 mypy 类型检查与 unittest (Linux 经 xvfb 实跑 GUI 用例)。
@@ -222,6 +222,7 @@ pyinstaller --noconfirm polyglot_builder.spec
 - **版本号统一**: 运行时代码、GUI、启动器与本文档统一标记为 v3.0，消除历史版本号混乱 (此前 bat 标 v2.0、本文档标 v2.2)
 - **CLI 增强**: 加 `--version`、`-y/--force` (非交互覆盖, 适合 CI)、`--compress [QUALITY]` (压缩外层视频)、`--batch MANIFEST` (批量构建)、`--log-file PATH` (日志持久化)；Ctrl+C 干净取消并清理半成品 (退出码 130)
 - **GUI 可取消构建**: 新增红色"取消"按钮, 构建中可中止并自动恢复/清理半成品输出；`RoundedButton` 支持自定义悬停/按下色
+- **双击直达 GUI**: 无参数运行 (含双击打包版 exe) 自动进入图形界面并隐藏随附控制台窗口; Windows 专用 ctypes 代码加 `sys.platform` 守卫, 使 mypy 在 Linux (CI ubuntu 矩阵) 亦通过
 - **ZIP64 路径修复**: 修复 `build_zip64_eocd_locator` 格式 (`<IQQ` → `<IIQI`, 此前 >4GB 文件直接崩溃)；分离 `ZIP64_MARKER` 与阈值使 ZIP64 路径可测；本地头 extra 不再误含 offset 字段
 - **ZIP64 数据描述符**: 修复字段顺序 (`<IQQQ` → `<IIQQ`, signature→CRC→compressed→uncompressed)；Deflate 模式下本地头 compressed 传 0 不写未知值
 - **临时文件异常安全**: 清理改用 `_auto_remove` / `_cancel_scope` contextmanager, 构建异常或取消时也清理
