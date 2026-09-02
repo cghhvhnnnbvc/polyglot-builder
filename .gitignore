@@ -21,3 +21,14 @@ polyglot_ffmpeg_*
 build/
 dist/
 *.manifest
+
+# ffmpeg 按需下载目录 (体积大, 运行时下载, 不入库)
+ffmpeg/
+
+# 日志文件 (CLI --log-file 产物)
+*.log
+
+# 虚拟环境
+.venv/
+venv/
+env/
