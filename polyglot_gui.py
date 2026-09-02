@@ -76,37 +76,40 @@ def _enable_drop(widget, on_drop):
     """
     if not _DROP_ENABLED:
         return
-    widget.update_idletasks()
-    hwnd = ctypes.windll.user32.GetParent(widget.winfo_id())
+    # 正向平台守卫: 令 mypy(Linux/CI ubuntu) 将下方 Windows 专用 ctypes 代码
+    # 判定为不可达而跳过 (这些名字仅在模块级 win32 分支定义)。
+    if sys.platform == 'win32':
+        widget.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(widget.winfo_id())
 
-    # 保留旧 wndproc 引用, 避免被 GC
-    state = {'prev': None}
+        # 保留旧 wndproc 引用, 避免被 GC
+        state = {'prev': None}
 
-    def _new_wndproc(hwnd, msg, wparam, lparam):
-        if msg == _WM_DROPFILES:
-            hdrop = wparam
-            # 查询文件数
-            count = _DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-            paths = []
-            for i in range(count):
-                length = _DragQueryFileW(hdrop, i, None, 0)
-                buf = ctypes.create_unicode_buffer(length + 1)
-                _DragQueryFileW(hdrop, i, buf, length + 1)
-                p = buf.value
-                if p and p not in paths:
-                    paths.append(p)
-            _DragFinish(hdrop)
-            if paths:
-                # 在 Tk 主线程安全地回调
-                widget.after(0, lambda: on_drop(paths))
-            return 0
-        return _CallWindowProcW(state['prev'], hwnd, msg, wparam, lparam)
+        def _new_wndproc(hwnd, msg, wparam, lparam):
+            if msg == _WM_DROPFILES:
+                hdrop = wparam
+                # 查询文件数
+                count = _DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+                paths = []
+                for i in range(count):
+                    length = _DragQueryFileW(hdrop, i, None, 0)
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    _DragQueryFileW(hdrop, i, buf, length + 1)
+                    p = buf.value
+                    if p and p not in paths:
+                        paths.append(p)
+                _DragFinish(hdrop)
+                if paths:
+                    # 在 Tk 主线程安全地回调
+                    widget.after(0, lambda: on_drop(paths))
+                return 0
+            return _CallWindowProcW(state['prev'], hwnd, msg, wparam, lparam)
 
-    proc = _WNDPROC_TYPE(_new_wndproc)
-    state['prev'] = _SetWindowLongW(hwnd, _GWL_WNDPROC, proc)
-    # 关键: 把 proc 绑定到 widget 防止 GC
-    widget._drop_proc = proc
-    _DragAcceptFiles(hwnd, True)
+        proc = _WNDPROC_TYPE(_new_wndproc)
+        state['prev'] = _SetWindowLongW(hwnd, _GWL_WNDPROC, proc)
+        # 关键: 把 proc 绑定到 widget 防止 GC
+        widget._drop_proc = proc
+        _DragAcceptFiles(hwnd, True)
 
 
 # ============================================================
@@ -1205,12 +1208,13 @@ class PolyglotGUI:
 # 启动入口
 # ============================================================
 def launch_gui():
-    # DPI 感知 (高分辨率屏)，必须在 tk.Tk() 之前调用
-    try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
+    # DPI 感知 (高分辨率屏)，必须在 tk.Tk() 之前调用; 仅 Windows
+    if sys.platform == 'win32':
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
 
     root = tk.Tk()
     _set_window_icon(root)
