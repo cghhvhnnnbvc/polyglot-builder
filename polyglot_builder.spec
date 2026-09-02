@@ -15,8 +15,8 @@
     不存在则程序仍可通过 find_ffmpeg()/download_ffmpeg() 按需下载。
   - 入口为 polyglot_build.py (含 CLI main 与 --gui 分发);
     polyglot_gui 为惰性导入, 用 hiddenimports 显式纳入。
-  - console=True 保留控制台以兼容 CLI 模式; 若只发布 GUI, 可将其改为
-    False 得到无控制台窗口的纯净体验。
+  - console=False (GUI 子系统): 双击 exe 直接弹 GUI, 彻底消除黑色控制台一闪;
+    代价是 exe 的 CLI 模式无控制台输出 (改用 --log-file 看日志, 或用源码跑 CLI)。
 """
 import os
 
@@ -54,7 +54,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,   # 保留控制台以兼容 CLI; 纯 GUI 发布可改为 False
+    console=False,  # GUI 子系统: 双击 exe 无黑色控制台闪烁; CLI 输出改走 --log-file
     icon=None,
 )
 
