@@ -14,3 +14,10 @@ __pycache__/
 # 运行时临时文件
 *.tmp
 polyglot_outer_*
+polyglot_compressed_*
+polyglot_ffmpeg_*
+
+# PyInstaller 打包产物
+build/
+dist/
+*.manifest
