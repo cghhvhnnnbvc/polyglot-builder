@@ -22,8 +22,12 @@ jobs:
 
       # 防呆: 标签名必须与 polyglot_build.VERSION 常量一致 (如 v1.0 ↔ '1.0'),
       # 防止版本号漂移 (曾发生过 bat/文档/代码版本号不一致的问题)
+      # 注: shell: python 执行时 sys.path[0] 是临时脚本目录而非仓库根目录,
+      # 必须显式设置 PYTHONPATH 才能导入 polyglot_build
       - name: 校验标签与 VERSION 常量一致
         shell: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           import polyglot_build, os
           tag = os.environ['GITHUB_REF_NAME']

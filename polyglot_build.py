@@ -873,14 +873,16 @@ def download_ffmpeg(dest_dir: Optional[str] = None,
     返回下载后 ffmpeg.exe 的路径。下载失败抛 OSError。
     通过 callback('info'/'download', ...) 报告进度。
     """
+    # 纯参数校验放在平台门槛之前, 保证跨平台行为一致 (越界一律 ValueError)
+    if mirror_index < 0 or mirror_index >= len(FFMPEG_MIRRORS):
+        raise ValueError(f'镜像索引越界: {mirror_index} (可选 0-{len(FFMPEG_MIRRORS) - 1})')
+
     if os.name != 'nt':
         raise OSError('当前仅支持在 Windows 上自动下载 ffmpeg。'
                       '其他平台请自行安装 ffmpeg 并加入 PATH。')
 
     dest = dest_dir or FFMPEG_LOCAL_DIR
     os.makedirs(dest, exist_ok=True)
-    if mirror_index < 0 or mirror_index >= len(FFMPEG_MIRRORS):
-        raise ValueError(f'镜像索引越界: {mirror_index} (可选 0-{len(FFMPEG_MIRRORS) - 1})')
 
     name, url = FFMPEG_MIRRORS[mirror_index]
     zip_path = os.path.join(dest, 'ffmpeg_download.zip')
