@@ -19,6 +19,9 @@
 | `polyglot_build.py` | 核心构建脚本 (GUI / CLI 共用核心逻辑) |
 | `polyglot_gui.py` | 图形界面 (tkinter, Python 标准库) |
 | `test_polyglot.py` | 回归测试 (unittest, 零依赖, `python -m unittest test_polyglot`) |
+| `polyglot_builder.spec` | PyInstaller 打包配置 (onedir, 可选) |
+| `build_dist.bat` | 一键打包脚本 (装 PyInstaller → 跑测试 → 打包, 可选) |
+| `.github/workflows/ci.yml` | GitHub Actions CI (mypy + unittest 多平台矩阵) |
 
 ## 安装要求
 
@@ -41,7 +44,7 @@
 4. 点 **"开始构建"**，等待约 1-2 分钟（构建中可点 **"取消"** 中止并自动清理半成品）
 5. 完成后弹窗显示文件路径和大小
 
-进度实时显示在进度条上，日志面板实时输出处理信息。构建与校验阶段均有进度反馈。
+进度实时显示在进度条上，日志面板实时输出处理信息（构建与校验阶段均有进度反馈）。日志面板右上角的“导出”按钮可将日志另存为 `.txt`，便于事后排查或反馈问题。
 
 ### 方式二: 命令行
 
@@ -61,8 +64,10 @@ polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 | `--deflate` | 使用 Deflate 压缩 (默认 Store 不压缩, RAR 已压缩无需再压) |
 | `--no-verify` | 跳过构建后 ZIP 完整性校验 |
 | `-y / --force` | 强制覆盖已存在的输出文件, 不交互询问 (适合脚本/CI) |
+| `--compress [QUALITY]` | 压缩外层视频以减小体积、提高隐蔽性 (需 ffmpeg); QUALITY: `high`/`medium`/`low`, 默认 `medium` |
+| `--batch MANIFEST` | 批量模式: 指定清单文本文件, 每行 `外层\|RAR[\|输出]`; 忽略空行与 `#` 注释行, 任一条失败不中断后续, 末尾汇总成败 |
+| `--log-file PATH` | 将日志额外持久化到指定文件 (追加模式, UTF-8), 便于事后排查 |
 | `--version` | 显示版本号 |
-| `--gui` | 启动图形界面 |
 
 > Ctrl+C 可随时中止 CLI 构建, 半成品输出会被自动清理。
 
@@ -72,7 +77,16 @@ polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 python polyglot_build.py video.mp4 game.rar
 python polyglot_build.py photo.jpg secret.rar -o result.jpg --deflate
 python polyglot_build.py document.pdf data.rar --output D:\upload\doc.pdf -y
+python polyglot_build.py --batch tasks.txt --log-file build.log -y
 polyglot_build.py --gui
+```
+
+批量清单 `tasks.txt` 示例 (每行 `外层|RAR[|输出]`, `#` 开头为注释):
+
+```text
+# 第三段输出可省略, 缺省时与外层同名
+D:\media\v1.mp4|D:\rar\s1.rar|D:\out\v1.mp4
+D:\media\v2.mp4|D:\rar\s2.rar
 ```
 
 ## 完整工作流
@@ -182,20 +196,45 @@ A: RAR AES-256 加密目前没有已知的有效破解方法。请妥善保管�
 **Q: 外层文件可以是任意格式吗?**
 A: 推荐使用 MP4 / PDF / JPEG / BMP / MP3。WebP 不能使用, PNG 和 GIF 部分工具可能不识别。详见"外层文件格式兼容性"表。
 
+## 打包发布 (可选)
+
+源码可直接用 Python 运行, 无需打包。若需分发给没有 Python 环境的用户, 可用 PyInstaller 打包为独立可执行程序:
+
+```bash
+# 方式一: 一键脚本 (Windows, 自动装 PyInstaller + 跑测试 + 打包)
+build_dist.bat
+
+# 方式二: 手动
+pip install pyinstaller
+pyinstaller --noconfirm polyglot_builder.spec
+```
+
+- 采用 **onedir** 模式 (产物在 `dist/PolyglotBuilder/`), 因 ffmpeg 体积大, onefile 冷启动慢。
+- 若源码目录下存在 `ffmpeg/`, 会被一并打包为**内置资源** (免运行时下载); 否则程序仍会按需下载。
+- 运行: `dist/PolyglotBuilder/PolyglotBuilder.exe --gui`。
+- spec 中 `console=True` 保留控制台以兼容 CLI; 若只发布 GUI, 可改为 `False` 去掉控制台窗口。
+
+持续集成: 仓库含 `.github/workflows/ci.yml`, 在 push/PR 时于 Windows + Ubuntu × Python 3.10/3.12 矩阵自动跑 mypy 类型检查与 unittest (Linux 经 xvfb 实跑 GUI 用例)。
+
 ## 版本更新记录
 
 ### v3.0 (2026-07-26)
 - **版本号统一**: 运行时代码、GUI、启动器与本文档统一标记为 v3.0，消除历史版本号混乱 (此前 bat 标 v2.0、本文档标 v2.2)
-- **CLI 增强**: 加 `--version`、`-y/--force` (非交互覆盖, 适合 CI)；Ctrl+C 干净取消并清理半成品 (退出码 130)
+- **CLI 增强**: 加 `--version`、`-y/--force` (非交互覆盖, 适合 CI)、`--compress [QUALITY]` (压缩外层视频)、`--batch MANIFEST` (批量构建)、`--log-file PATH` (日志持久化)；Ctrl+C 干净取消并清理半成品 (退出码 130)
 - **GUI 可取消构建**: 新增红色"取消"按钮, 构建中可中止并自动恢复/清理半成品输出；`RoundedButton` 支持自定义悬停/按下色
 - **ZIP64 路径修复**: 修复 `build_zip64_eocd_locator` 格式 (`<IQQ` → `<IIQI`, 此前 >4GB 文件直接崩溃)；分离 `ZIP64_MARKER` 与阈值使 ZIP64 路径可测；本地头 extra 不再误含 offset 字段
 - **ZIP64 数据描述符**: 修复字段顺序 (`<IQQQ` → `<IIQQ`, signature→CRC→compressed→uncompressed)；Deflate 模式下本地头 compressed 传 0 不写未知值
 - **临时文件异常安全**: 清理改用 `_auto_remove` / `_cancel_scope` contextmanager, 构建异常或取消时也清理
-- **流式循环重构**: 抽取 `_stream_copy` 统一 Deflate/Store 两段重复循环
+- **流式循环重构**: 抽取 `_stream_copy` 统一复制外层/Deflate/Store 三段循环, 均带 0.2s 进度节流 (首帧即报)
 - **校验进度**: `verify_polyglot` 改为分块流式 CRC 校验, 大文件校验时不再 UI 假死
 - **类型注解**: 核心函数补充类型注解 (基于 `from __future__ import annotations`)
-- **测试与质量**: 新增 `test_polyglot.py` (unittest, 零依赖, 28 用例) 守护数据描述符/端到端轮转/ZIP64 边界/取消/CLI/verify 正负/输出对话框/自动同步；测试即发现并修复了两个 ZIP64 真实 bug
-- **仓库规范**: 新增 `.gitignore` (排除 `__pycache__/` `*.pyc` 等) 与 `LICENSE` (MIT)
+- **视频压缩真实进度**: `compress_video` 改用 `-progress pipe:1 -nostats` 按行解析 `out_time` 上报百分比; stderr 重定向到临时文件修复长编码管道写满导致的死锁隐患
+- **安全加固**: ffmpeg 下载解压改用 `_safe_extractall` 防 Zip Slip (校验 realpath 落在目标目录内)
+- **隐蔽性增强**: ZIP 条目写入真实 DOS 时间戳 (取自 RAR 的 mtime, 避免 1980-00-00 异常特征); 构建前预估输出体积; `_validate_rar` 校验 RAR 魔数 (非 RAR 仅警告不中断)
+- **日志持久化**: CLI `--log-file` 挂 FileHandler (追加/UTF-8/带时间戳级别); GUI 日志区新增"导出"按钮另存为 .txt
+- **打包分发**: 新增 `polyglot_builder.spec` (PyInstaller onedir, 条件内置 ffmpeg) 与 `build_dist.bat` 一键打包脚本
+- **测试与质量**: 新增 `test_polyglot.py` (unittest, 零依赖, 69 用例) 守护数据描述符/端到端轮转/ZIP64 边界/取消/CLI 分发 (--compress/--gui/--batch)/verify 正负/输出对话框/自动同步/版本一致性/进度解析/DOS 时间戳/RAR 校验/日志持久化；测试即发现并修复了两个 ZIP64 真实 bug
+- **仓库规范**: 新增 `.gitignore` (排除 `__pycache__/` `*.pyc` `build/` `dist/` 等)、`LICENSE` (MIT) 与 `.github/workflows/ci.yml` (Windows+Ubuntu × py3.10/3.12 矩阵跑 mypy + unittest)
 
 ### v2.2 (2026-07-26)
 - **UI 全面升级**: 窗口默认从 680×560 扩大到 880×700, 所有字号全面提升 (标题 24px / 标签 14px / 按钮 16px 等)

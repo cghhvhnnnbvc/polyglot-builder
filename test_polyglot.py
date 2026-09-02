@@ -476,6 +476,45 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertTrue(os.path.exists(out))
 
+    def test_cli_compress_invokes_compress_video(self):
+        # --compress: 先 compress_video 压缩外层, 再用压缩产物拼接
+        from unittest import mock
+        outer = self._make_file('movie.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+
+        with mock.patch('polyglot_build.compress_video') as cv, \
+                mock.patch('polyglot_build.build_polyglot') as bp, \
+                mock.patch('polyglot_build.verify_polyglot'):
+            code, _o, err = self._run_main(
+                ['polyglot_build.py', outer, rar, '-o', out, '-q',
+                 '--compress', 'medium'])
+
+        self.assertEqual(code, 0, err)
+        cv.assert_called_once()
+        # call_args[1] 为 kwargs (兼容 3.6/3.7, 不用 .kwargs)
+        self.assertEqual(cv.call_args[1].get('quality'), 'medium')
+        bp.assert_called_once()
+        # call_args[0][0] 为第一个位置参 (effective_outer)
+        used_outer = bp.call_args[0][0]
+        self.assertIn('polyglot_compressed_', used_outer,
+                      'build_polyglot 应使用压缩产物作为外层')
+
+    def test_cli_gui_flag_dispatches_to_gui(self):
+        # --gui: 分发到 polyglot_gui.launch_gui 并 sys.exit(0)
+        from unittest import mock
+        import types
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            self.skipTest('tkinter 不可用')
+        fake = types.ModuleType('polyglot_gui')
+        fake.launch_gui = mock.MagicMock()
+        with mock.patch.dict('sys.modules', {'polyglot_gui': fake}):
+            code, _o, err = self._run_main(['polyglot_build.py', '--gui'])
+        self.assertEqual(code, 0, err)
+        fake.launch_gui.assert_called_once()
+
 
 class TestProgressCallback(unittest.TestCase):
     """守护 P0: 非 TTY 下 progress_callback 不打印 \r 进度条 (避免重定向乱码)。"""
@@ -588,6 +627,165 @@ class TestFFmpegDownload(unittest.TestCase):
             with self.assertRaises(OSError):
                 download_ffmpeg(dest_dir=tmp)
 
+    def test_download_extracts_and_locates_exe(self):
+        """完整链路: 下载 (mock 网络) -> 解压 -> _local_ffmpeg 定位到 exe。
+
+        用本地构造的假 zip 充当 urlopen 返回, 不触碰真实网络/系统环境。
+        验证 find_ffmpeg 缺失检测 -> 下载 -> 解压 -> 本地定位 这条核心路径。
+        """
+        import io
+        from unittest import mock
+
+        # 构造一个含 ffmpeg.exe 的假 zip (模拟 gyan.dev / BtbN 的目录结构)
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, 'w') as zf:
+            zf.writestr('ffmpeg-release/bin/ffmpeg.exe', b'FAKE_FFMPEG_BINARY')
+        zip_bytes.seek(0)
+
+        class _FakeResp:
+            """模仿 urllib 响应: 支持 headers 与 read()。"""
+            def __init__(self, data):
+                self._data = data
+                self.headers = {'Content-Length': str(len(data))}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                if n == -1:
+                    chunk, self._data = self._data, b''
+                else:
+                    chunk, self._data = self._data[:n], self._data[n:]
+                return chunk
+
+        tmp = tempfile.mkdtemp(prefix='ffmpeg_dl_')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # 隔离 _APP_DIR, 避免真实环境中 _APP_DIR/ffmpeg 下有缓存干扰
+        app_dir = tempfile.mkdtemp(prefix='ffmpeg_app_')
+        self.addCleanup(shutil.rmtree, app_dir, ignore_errors=True)
+
+        # 把下载目录指向临时目录, 且确保系统 PATH 也无 ffmpeg
+        with mock.patch('polyglot_build.os.name', 'nt'), \
+                mock.patch('polyglot_build.FFMPEG_LOCAL_DIR', tmp), \
+                mock.patch('polyglot_build._APP_DIR', app_dir), \
+                mock.patch('shutil.which', return_value=None), \
+                mock.patch('urllib.request.urlopen',
+                           return_value=_FakeResp(zip_bytes.getvalue())):
+            # 下载前: 本地无缓存 + PATH 无 -> find_ffmpeg 返回 None
+            self.assertIsNone(find_ffmpeg(),
+                              '下载前 find_ffmpeg 应返回 None (模拟干净环境)')
+            # 执行下载
+            exe = download_ffmpeg(dest_dir=tmp)
+            # 下载后: _local_ffmpeg 能定位到解压出的 exe
+            self.assertTrue(exe.endswith('ffmpeg.exe'),
+                            f'解压后未定位到 ffmpeg.exe: {exe}')
+            self.assertTrue(os.path.isfile(exe),
+                            '定位到的 ffmpeg.exe 应真实存在')
+            self.assertEqual(find_ffmpeg(), exe,
+                             '下载后 find_ffmpeg 应返回刚解压的 exe 路径')
+
+    def test_download_reports_progress(self):
+        """下载过程应回调 callback('download', cur, total) 上报进度。"""
+        import io
+        from unittest import mock
+
+        # 构造合法 zip, 内部放一个较大假 exe, 使分块 read 触发多次回调
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, 'w') as zf:
+            zf.writestr('ffmpeg-release/bin/ffmpeg.exe',
+                        b'FAKE_FFMPEG_BINARY' * (40 * 1024))  # 约 640KB
+        data = zip_bytes.getvalue()
+
+        class _FakeResp:
+            def __init__(self, data):
+                self._data = data
+                self.headers = {'Content-Length': str(len(data))}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=-1):
+                if n == -1:
+                    chunk, self._data = self._data, b''
+                else:
+                    chunk, self._data = self._data[:n], self._data[n:]
+                return chunk
+
+        tmp = tempfile.mkdtemp(prefix='ffmpeg_dl_')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        calls = []
+        with mock.patch('polyglot_build.os.name', 'nt'), \
+                mock.patch('polyglot_build.FFMPEG_LOCAL_DIR', tmp), \
+                mock.patch('urllib.request.urlopen',
+                           return_value=_FakeResp(data)):
+            download_ffmpeg(dest_dir=tmp,
+                            callback=lambda phase, cur, total, msg:
+                            calls.append((phase, cur, total)))
+        # 应至少上报一次 download 进度 (分块读取触发)
+        self.assertTrue(any(p == 'download' for p, _c, _t in calls),
+                        '应至少上报一次 download 进度')
+
+
+class TestGuiRunFfmpegMissing(unittest.TestCase):
+    """守护 GUI 构建流程: ffmpeg 缺失时走'提示下载'分支 (不真弹窗)。
+
+    模拟干净环境 (find_ffmpeg 返回 None + 勾选压缩), 验证 _run 在构建前
+    检测到 ffmpeg 缺失并触发下载引导, 而非直接调用 compress_video 失败。
+    """
+
+    def _build_gui(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        root.update()
+        return root, gui
+
+    def test_run_prompts_download_when_ffmpeg_missing(self):
+        from unittest import mock
+
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+
+        # 勾选压缩表面视频
+        gui._compress_var.set(True)
+
+        # 记录 _run 内所有 root.after 入队 (避免真弹窗/真构建, 仅验证分支)
+        after_calls = []
+        tmpdir = tempfile.mkdtemp(prefix='gui_run_')
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        outer = os.path.join(tmpdir, 'movie.mp4')  # 扩展名必须是视频
+        rar = os.path.join(tmpdir, 'data.rar')
+        out = os.path.join(tmpdir, 'output.bin')
+        with mock.patch('polyglot_gui.find_ffmpeg', return_value=None), \
+                mock.patch.object(root, 'after',
+                                  side_effect=lambda *a, **k: after_calls.append(a)), \
+                mock.patch('polyglot_gui.build_polyglot') as build:
+            gui._run(outer, rar, out)
+
+        # 应触发下载引导: after 队列里包含 _prompt_download_ffmpeg 入队
+        # 注意: 每次访问 gui._prompt_download_ffmpeg 生成新的绑定方法对象,
+        # 故比较底层 __func__ (稳定身份) 而非 is 绑定方法
+        prompt_queued = any(
+            len(c) >= 2
+            and getattr(c[1], '__func__', None) is PolyglotGUI._prompt_download_ffmpeg
+            for c in after_calls
+        )
+        self.assertTrue(prompt_queued,
+                        'ffmpeg 缺失时应将引导下载入队 (而非直接构建失败)')
+        # 不应进入真正构建 (避免压缩失败)
+        build.assert_not_called()
+
 
 class TestGuiLayout(unittest.TestCase):
     """守护 GUI 布局: 防止列争抢宽度导致标题/卡片/按钮被挤压错乱。
@@ -600,7 +798,10 @@ class TestGuiLayout(unittest.TestCase):
 
     def _build_gui(self):
         import tkinter as tk
-        root = tk.Tk()
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
         root.geometry('880x700')
         gui = PolyglotGUI(root)
         root.update_idletasks()
@@ -662,6 +863,286 @@ class TestGuiLayout(unittest.TestCase):
         self.assertIsNotNone(title, '未找到标题')
         self.assertGreater(title.winfo_width(), 100,
                            f'标题被裁切: 宽度仅 {title.winfo_width()}')
+
+
+class TestVersionConsistency(unittest.TestCase):
+    """守护 C3: VERSION 常量与 bat 启动器中硬编码版本号一致, 防漂移。"""
+
+    def test_version_format(self):
+        import re
+        self.assertRegex(polyglot_build.VERSION, r'^\d+\.\d+$')
+
+    def test_bat_versions_match_constant(self):
+        import re
+        ver = polyglot_build.VERSION
+        base = os.path.dirname(os.path.abspath(__file__))
+        checked = 0
+        for bat in ('polyglot_build.bat', '启动GUI.bat'):
+            path = os.path.join(base, bat)
+            if not os.path.isfile(path):
+                continue
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+            for m in re.findall(r'v(\d+\.\d+)', text):
+                self.assertEqual(
+                    m, ver,
+                    f'{bat} 中 v{m} 与 polyglot_build.VERSION={ver} 不一致')
+                checked += 1
+        self.assertGreater(checked, 0,
+                           '未在任何 bat 中找到版本号, 一致性守护失效')
+
+
+class TestCompressVideoProgress(unittest.TestCase):
+    """守护 1.4: compress_video 解析 ffmpeg -progress 输出并换算百分比进度。"""
+
+    def _fake_proc(self, lines, returncode=0):
+        class _FakeProc:
+            def __init__(self):
+                self.stdout = iter(lines)
+                self.returncode = returncode
+
+            def wait(self, *a, **k):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+        return _FakeProc()
+
+    def test_progress_emits_increasing_pct(self):
+        from unittest import mock
+        proc = self._fake_proc([
+            b'frame=10\n',
+            b'out_time=00:00:02.000000\n',
+            b'progress=continue\n',
+            b'out_time=00:00:05.000000\n',
+            b'out_time=00:00:09.000000\n',
+            b'progress=end\n',
+        ])
+        pcts = []
+
+        def cb(phase, cur, total, msg):
+            if phase == 'compress' and total == 100:
+                pcts.append(cur)
+
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/bin/ffmpeg'), \
+                mock.patch('polyglot_build._find_ffprobe', return_value='/bin/ffprobe'), \
+                mock.patch('polyglot_build._probe_duration', return_value=10.0), \
+                mock.patch('polyglot_build.subprocess.Popen', return_value=proc):
+            compress_video('in.mp4', 'out.mp4', quality='medium', callback=cb)
+
+        # out_time 2/5/9 秒, duration 10 秒 -> 20% / 50% / 90%
+        self.assertEqual(pcts, [20, 50, 90])
+
+    def test_no_progress_when_duration_unknown(self):
+        # ffprobe 缺失 (duration=None): 仍排空 stdout 不报错, 但不产出百分比进度
+        from unittest import mock
+        proc = self._fake_proc([b'out_time=00:00:03.000000\n', b'progress=end\n'])
+        phases = []
+
+        def cb(phase, cur, total, msg):
+            phases.append(phase)
+
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/bin/ffmpeg'), \
+                mock.patch('polyglot_build._find_ffprobe', return_value=None), \
+                mock.patch('polyglot_build.subprocess.Popen', return_value=proc):
+            compress_video('in.mp4', 'out.mp4', quality='low', callback=cb)
+
+        self.assertNotIn('compress', phases)
+        self.assertIn('info', phases)
+
+
+class TestDosDatetime(unittest.TestCase):
+    """守护 4.1: _dos_datetime_from_mtime 的 DOS 时间/日期换算。"""
+
+    def test_known_local_datetime_roundtrip(self):
+        # 构造确定的本地时间 (2021-03-04 05:06:08); mktime/localtime 同时区, 可往返
+        mtime = time.mktime((2021, 3, 4, 5, 6, 8, 0, 0, -1))
+        dos_time, dos_date = polyglot_build._dos_datetime_from_mtime(mtime)
+        # DOS 时间: 时<<11 | 分<<5 | 秒//2
+        self.assertEqual(dos_time >> 11, 5)
+        self.assertEqual((dos_time >> 5) & 0x3F, 6)
+        self.assertEqual(dos_time & 0x1F, 4)   # 8 // 2
+        # DOS 日期: (年-1980)<<9 | 月<<5 | 日
+        self.assertEqual((dos_date >> 9) + 1980, 2021)
+        self.assertEqual((dos_date >> 5) & 0x0F, 3)
+        self.assertEqual(dos_date & 0x1F, 4)
+
+    def test_pre_1980_clamped_to_dos_epoch(self):
+        # epoch 0 (1970/1969 视时区) 早于 DOS 纪元, 年份应钳制到 1980
+        _dos_time, dos_date = polyglot_build._dos_datetime_from_mtime(0)
+        self.assertEqual((dos_date >> 9) + 1980, 1980)
+
+
+class TestValidateRar(unittest.TestCase):
+    """守护 4.3: _validate_rar 魔数校验 (是 RAR 返回 None, 否则返回警告)。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write(self, name, data):
+        p = os.path.join(self.tmpdir, name)
+        with open(p, 'wb') as f:
+            f.write(data)
+        return p
+
+    def test_rar5_magic_ok(self):
+        p = self._write('a.rar', polyglot_build.RAR5_MAGIC + b'\x00' * 20)
+        self.assertIsNone(polyglot_build._validate_rar(p))
+
+    def test_rar4_magic_ok(self):
+        p = self._write('b.rar', polyglot_build.RAR4_MAGIC + b'\x00' * 20)
+        self.assertIsNone(polyglot_build._validate_rar(p))
+
+    def test_non_rar_returns_warning(self):
+        p = self._write('c.bin', b'NOT A RAR FILE AT ALL')
+        warn = polyglot_build._validate_rar(p)
+        self.assertIsNotNone(warn)
+        self.assertIn('RAR', warn)
+
+    def test_missing_file_returns_warning(self):
+        warn = polyglot_build._validate_rar(
+            os.path.join(self.tmpdir, 'ghost.rar'))
+        self.assertIsNotNone(warn)
+        self.assertIn('无法读取', warn)
+
+
+class TestLogFilePersistence(unittest.TestCase):
+    """守护 4.4: setup_logging(log_file=...) 挂 FileHandler 且幂等、可写。"""
+
+    def setUp(self):
+        import logging
+        self.tmpdir = tempfile.mkdtemp()
+        self._logging = logging
+
+    def tearDown(self):
+        # 清理本类挂上的 FileHandler, 避免污染模块级 logger 单例
+        logger = get_logger()
+        for h in list(logger.handlers):
+            if isinstance(h, self._logging.FileHandler):
+                logger.removeHandler(h)
+                h.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_log_file_handler_attached_and_written(self):
+        path = os.path.join(self.tmpdir, 'run.log')
+        setup_logging(self._logging.INFO, log_file=path)
+        logger = get_logger()
+        fhs = [h for h in logger.handlers
+               if isinstance(h, self._logging.FileHandler)]
+        self.assertEqual(len(fhs), 1)
+        # 幂等: 同一文件再次调用不重复挂
+        setup_logging(self._logging.INFO, log_file=path)
+        fhs = [h for h in logger.handlers
+               if isinstance(h, self._logging.FileHandler)]
+        self.assertEqual(len(fhs), 1)
+        # 写入日志 -> 文件内容包含该行 (文件 handler 带级别前缀)
+        logger.info('persisted-line-xyz')
+        for h in fhs:
+            h.flush()
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn('persisted-line-xyz', content)
+        self.assertIn('INFO', content)
+
+
+class TestBatchMode(unittest.TestCase):
+    """守护 4.5: _parse_batch_manifest 解析 + --batch 端到端汇总成败。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_file(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _run_main(self, argv):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest import mock
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), \
+                redirect_stdout(buf_out), redirect_stderr(buf_err):
+            try:
+                polyglot_build.main()
+                exit_code = 0
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+        return exit_code, buf_out.getvalue(), buf_err.getvalue()
+
+    def test_parse_manifest_basic(self):
+        manifest = os.path.join(self.tmpdir, 'm.txt')
+        with open(manifest, 'w', encoding='utf-8') as f:
+            f.write('# 注释行\n')
+            f.write('\n')
+            f.write('  a.mp4 | a.rar \n')       # 2 段: output 默认= outer
+            f.write('b.mp4|b.rar|out_b.mp4\n')  # 3 段: 显式 output
+        tasks = polyglot_build._parse_batch_manifest(manifest)
+        self.assertEqual(tasks, [
+            ('a.mp4', 'a.rar', 'a.mp4'),
+            ('b.mp4', 'b.rar', 'out_b.mp4'),
+        ])
+
+    def test_parse_manifest_invalid_line_raises(self):
+        manifest = os.path.join(self.tmpdir, 'bad.txt')
+        with open(manifest, 'w', encoding='utf-8') as f:
+            f.write('only_one_field\n')
+        with self.assertRaises(ValueError):
+            polyglot_build._parse_batch_manifest(manifest)
+
+    def test_parse_manifest_missing_file_raises(self):
+        with self.assertRaises(IOError):
+            polyglot_build._parse_batch_manifest(
+                os.path.join(self.tmpdir, 'nope.txt'))
+
+    def test_batch_end_to_end_success(self):
+        o1 = self._make_file('v1.bin', b'OUTER1' * 50)
+        r1 = self._make_file('d1.rar', polyglot_build.RAR5_MAGIC + b'X' * 50)
+        out1 = os.path.join(self.tmpdir, 'out1.bin')
+        o2 = self._make_file('v2.bin', b'OUTER2' * 50)
+        r2 = self._make_file('d2.rar', polyglot_build.RAR4_MAGIC + b'Y' * 50)
+        out2 = os.path.join(self.tmpdir, 'out2.bin')
+        manifest = os.path.join(self.tmpdir, 'batch.txt')
+        with open(manifest, 'w', encoding='utf-8') as f:
+            f.write(f'{o1}|{r1}|{out1}\n')
+            f.write(f'{o2}|{r2}|{out2}\n')
+        code, _o, err = self._run_main(
+            ['polyglot_build.py', '--batch', manifest, '-q'])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(out1))
+        self.assertTrue(os.path.exists(out2))
+        self.assertTrue(verify_polyglot(out1))
+        self.assertTrue(verify_polyglot(out2))
+
+    def test_batch_partial_failure_exits_1(self):
+        o1 = self._make_file('ok.bin', b'OUTER' * 50)
+        r1 = self._make_file('ok.rar', polyglot_build.RAR5_MAGIC + b'Z' * 50)
+        out1 = os.path.join(self.tmpdir, 'ok_out.bin')
+        missing = os.path.join(self.tmpdir, 'missing.bin')
+        m_out = os.path.join(self.tmpdir, 'm_out.bin')
+        manifest = os.path.join(self.tmpdir, 'mixed.txt')
+        with open(manifest, 'w', encoding='utf-8') as f:
+            f.write(f'{o1}|{r1}|{out1}\n')
+            f.write(f'{missing}|{r1}|{m_out}\n')  # 外层不存在 -> 失败不中断
+        code, _o, err = self._run_main(
+            ['polyglot_build.py', '--batch', manifest, '-q'])
+        self.assertEqual(code, 1, err)
+        # 第一条仍应成功产出
+        self.assertTrue(os.path.exists(out1))
 
 
 if __name__ == '__main__':

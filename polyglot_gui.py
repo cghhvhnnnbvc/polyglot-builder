@@ -366,9 +366,18 @@ class Tooltip:
     用法:
         Tooltip(widget, text='说明文字')
 
-    鼠标移入 (Enter) 延迟约 0.5s 后在光标附近显示一个小黄框,
+    鼠标移入 (Enter) 延迟约 0.5s 后在光标附近显示提示卡,
     移出 (Leave) 时自动关闭。支持换行文本 (用 \\n)。
+
+    风格与主 UI 一致: 白底、浅灰描边、Segoe UI 9pt 文本、无
+    立体浮雕, 仅靠 1px 边框营造边界 (主 UI 也是这种扁平处理)。
     """
+
+    # 配色常量, 与顶部 C_BG / C_BORDER / C_TEXT 保持视觉一致
+    _BG = '#FFFFFF'        # 白底, 与卡片同色
+    _FG = '#333333'        # 与主文本色接近
+    _BORDER = '#D9D9DE'    # 浅灰描边, 与卡片边框同色
+    _FONT = ('Segoe UI', 9)  # 跨平台, _resolve_fonts 已优先选用本地字体
 
     def __init__(self, widget, text: str, delay_ms: int = 500):
         self._widget = widget
@@ -392,14 +401,22 @@ class Tooltip:
         self._tip = tk.Toplevel(self._widget)
         self._tip.wm_overrideredirect(True)   # 无边框窗口
         self._tip.wm_geometry(f'+{x}+{y}')
-        label = tk.Label(
-            self._tip, text=self._text, justify=tk.LEFT,
-            background='#FFFFE0', foreground='#333333',
-            relief='solid', borderwidth=1,
-            font=('TkDefaultFont', 9),
-            padx=8, pady=6, wraplength=320
+
+        # 外层 Frame 负责 1px 浅灰描边 (主 UI 同款边框色)
+        frame = tk.Frame(
+            self._tip, background=self._BORDER, bd=0, highlightthickness=0
         )
-        label.pack()
+        frame.pack()
+
+        # 内层 Label 承载内容, 白底无独立边框, 整体看上去仍是 1px 描边
+        label = tk.Label(
+            frame, text=self._text, justify=tk.LEFT,
+            background=self._BG, foreground=self._FG,
+            font=self._FONT,
+            padx=10, pady=8, wraplength=320,
+            bd=0, highlightthickness=0,
+        )
+        label.pack(padx=1, pady=1)  # 1px 间隙 = 描边
 
     def _hide(self, _event):
         if self._after_id is not None:
@@ -502,7 +519,15 @@ class PolyglotGUI:
             state='readonly' if enabled else 'disabled')
 
     def _prompt_download_ffmpeg(self):
-        """未检测到 ffmpeg 时, 弹出提示框让用户选择下载/取消。"""
+        """未检测到 ffmpeg 时, 弹出提示框让用户选择下载/取消。
+
+        本次构建已因此中断: 进入时先恢复 UI 可用状态 (build 重新可点,
+        cancel 禁用), 避免移除旧的 _on_error 弹窗后按钮卡在禁用态。
+        """
+        # 中断本次构建: 先解锁 UI
+        self.build_btn.configure(state=tk.NORMAL)
+        self.cancel_btn.configure(state=tk.DISABLED)
+        self._set_status('需要 ffmpeg')
         # 镜像选项文本
         mirror_names = [name for name, _url in FFMPEG_MIRRORS]
         result = messagebox.askquestion(
@@ -512,7 +537,8 @@ class PolyglotGUI:
             '是否从网络下载并自动安装？\n\n'
             f'默认镜像: {mirror_names[0]}\n'
             '(如下载缓慢可切换国内镜像)\n\n'
-            '点击"否"将取消压缩, 但可继续普通构建。',
+            '点击"否"将取消压缩。\n'
+            '下载安装完成后, 请重新点击「开始构建」。',
             icon='question')
         if result != 'yes':
             self._compress_var.set(False)
@@ -669,11 +695,29 @@ class PolyglotGUI:
         # 输入框: 扁平、无边框、内嵌于卡片
         s.configure('TEntry', font=FONT_ENTRY, padding=(10, 7),
                      borderwidth=0, relief='flat', fieldbackground=C_CARD)
+        # 下拉框: 与输入框视觉一致, 白底无高亮底纹
+        s.configure('TCombobox', font=FONT_ENTRY, padding=(8, 6),
+                     borderwidth=1, relief='flat', fieldbackground=C_CARD,
+                     background=C_CARD, foreground=C_TEXT, arrowcolor=C_TEXT_SEC)
+        s.map('TCombobox',
+              fieldbackground=[('readonly', C_CARD), ('disabled', C_BG),
+                               ('focus', C_CARD), ('active', C_CARD)],
+              background=[('readonly', C_CARD), ('disabled', C_BG),
+                          ('active', C_CARD)],
+              foreground=[('readonly', C_TEXT), ('disabled', C_TEXT_SEC)],
+              selectbackground=[('readonly', C_CARD), ('focus', C_CARD)],
+              selectforeground=[('readonly', C_TEXT), ('focus', C_TEXT)],
+              arrowcolor=[('disabled', C_TEXT_SEC)])
+        # 下拉列表项 (TCombobox 的 Listbox): 选中态主色蓝底白字, 取消系统蓝高亮
+        s.configure('ComboboxPopdownFrame', background=C_CARD)
+        s.configure('TCombobox.Listbox', background=C_CARD, foreground=C_TEXT,
+                     selectbackground=C_PRIMARY, selectforeground='white',
+                     font=FONT_ENTRY, borderwidth=0)
         # 浏览按钮
         s.configure('TButton', font=FONT_BROWSE, padding=(12, 4),
                      borderwidth=0, relief='flat')
         # 进度条
-        s.configure('Horizontal.TProgressbar', thickness=10,
+        s.configure('Horizontal.TProgressbar', thickness=12,
                      troughcolor=C_BAR_BG, background=C_BAR_FILL, borderwidth=0)
 
     # --------------------------------------------------------
@@ -731,35 +775,73 @@ class PolyglotGUI:
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
         # === 选项区 (Deflate 压缩 / 表面视频压缩 + 档位) ===
-        # 垂直堆叠, 横向填满: 复选框/下拉在左, 右侧淡灰小字提示填满空白
+        # 并排显示: 所有控件在左侧单行排列, 无右侧文字, 避免浅灰底纹突出
         # 带 ⓘ 图标提示该控件有悬浮说明
         opt_frame = ttk.Frame(main)
         opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
 
-        # 第 1 行: Deflate 压缩 + 右侧提示
-        deflate_row = ttk.Frame(opt_frame)
-        deflate_row.pack(anchor='w', fill='x', pady=(0, 4))
+        # 自定义复选框: 用 Unicode 方框字符代替系统 indicator,
+        # 方框随字号放大, 无 image 依赖 (跨多 Tk 根安全)。
+        CB_BOX = '\u2610'   # ☐ 未选中
+        CB_CHECK = '\u2611' # ☑ 选中
+
+        def _mk_checkbox(master, label, var, cmd=None, info_tip=None):
+            """创建带角标 ⓘ 的复选框。
+
+            ⓘ 不放在 text 里 (与正文同字号会偏大), 而是用独立小 Label
+            紧贴 Checkbutton 右侧, 字号 8pt + 淡灰色, 视觉上像数学角标。
+            """
+            full = tk.StringVar()
+
+            def _refresh(*_a):
+                sym = CB_CHECK if var.get() else CB_BOX
+                full.set(f'{sym}  {label}')
+
+            var.trace_add('write', _refresh)
+            _refresh()
+            cb = tk.Checkbutton(
+                master, textvariable=full, variable=var,
+                bg=C_BG, fg=C_TEXT, activebackground=C_BG,
+                activeforeground=C_TEXT, selectcolor=C_BG,
+                font=(FONT_ENTRY[0], 11),  # 与卡片输入框一致, 方框随字放大
+                bd=0, highlightthickness=0, relief='flat',
+                indicatoron=False, compound=tk.LEFT,
+                command=cmd,
+            )
+            # 角标 ⓘ: 小字号 + 淡灰色 + 顶部对齐 (贴近文字顶)
+            info = tk.Label(
+                master, text='\u24d8',
+                bg=C_BG, fg=C_TEXT_SEC,
+                font=(FONT_ENTRY[0], 8, 'bold'),
+                cursor='question_arrow',
+                bd=0, highlightthickness=0,
+            )
+            if info_tip:
+                Tooltip(info, info_tip)
+            return cb, info
+
         self._deflate_var = tk.BooleanVar(value=False)
-        deflate_cb = ttk.Checkbutton(
-            deflate_row, text='Deflate 压缩 ⓘ', variable=self._deflate_var
-        )
-        deflate_cb.pack(side=tk.LEFT)
+        deflate_cb, deflate_info = _mk_checkbox(
+            opt_frame, 'Deflate 压缩', self._deflate_var,
+            info_tip='对内部 RAR 数据使用 Deflate 压缩。\n'
+                     '默认关闭 (RAR 本身已高度压缩, 再压收益极小且更耗时)。\n'
+                     '通常无需开启。')
+        deflate_cb.pack(side=tk.LEFT, padx=(0, 2))
+        deflate_info.pack(side=tk.LEFT, padx=(0, 22), pady=(4, 0))
         Tooltip(deflate_cb,
                 '对内部 RAR 数据使用 Deflate 压缩。\n'
                 '默认关闭 (RAR 本身已高度压缩, 再压收益极小且更耗时)。\n'
                 '通常无需开启。')
-        tk.Label(deflate_row, text='RAR 已压缩, 通常无需开启',
-                 fg='#888888', font=FONT_HINT).pack(side=tk.RIGHT, padx=(0, 4))
 
-        # 第 2 行: 压缩复选框 + 质量档位下拉 (左) + 右侧提示 (右)
-        compress_row = ttk.Frame(opt_frame)
-        compress_row.pack(anchor='w', fill='x')
         self._compress_var = tk.BooleanVar(value=False)
-        compress_cb = ttk.Checkbutton(
-            compress_row, text='压缩表面视频 ⓘ',
-            variable=self._compress_var, command=self._on_compress_toggle
-        )
-        compress_cb.pack(side=tk.LEFT, padx=(0, 12))
+        compress_cb, compress_info = _mk_checkbox(
+            opt_frame, '压缩表面视频', self._compress_var,
+            cmd=self._on_compress_toggle,
+            info_tip='用 ffmpeg 压缩外层视频, 减小最终文件体积, 提高隐蔽性。\n\n'
+                     '用长视频做外层并压缩, 可避免"表面是小文件却占用几个 G"\n'
+                     '的违和感, 降低被平台判定为异常文件的风险。')
+        compress_cb.pack(side=tk.LEFT, padx=(0, 2))
+        compress_info.pack(side=tk.LEFT, padx=(0, 12), pady=(4, 0))
         Tooltip(compress_cb,
                 '用 ffmpeg 压缩外层视频, 减小最终文件体积, 提高隐蔽性。\n\n'
                 '用长视频做外层并压缩, 可避免"表面是小文件却占用几个 G"\n'
@@ -769,8 +851,9 @@ class PolyglotGUI:
         self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
         quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
         self._quality_combo = ttk.Combobox(
-            compress_row, state='disabled', width=20,
-            textvariable=self._quality_var, values=quality_labels
+            opt_frame, state='disabled', width=26,  # 容纳 'medium - 中 (1.5Mbps, 720p)' 全长
+            textvariable=self._quality_var, values=quality_labels,
+            font=FONT_ENTRY,
         )
         self._quality_combo.pack(side=tk.LEFT, padx=(0, 12))
         self._quality_combo.set(quality_labels[0])
@@ -781,10 +864,6 @@ class PolyglotGUI:
                 '· 中: 1.5Mbps, 720p (体积与清晰度平衡, 推荐)\n'
                 '· 低: 0.8Mbps, 480p (体积最小, 画面略糊)\n\n'
                 '仅勾选"压缩表面视频"后可用。')
-
-        # 第 2 行右侧提示 (压缩后体积更合理, 降低"小文件几个 G"违和)
-        tk.Label(compress_row, text='降低小文件却几个 G 的违和感',
-                 fg='#888888', font=FONT_HINT).pack(side=tk.RIGHT, padx=(0, 4))
 
         # === 构建按钮 (Canvas 圆角) ===
         btn_frame = ttk.Frame(main)
@@ -804,7 +883,7 @@ class PolyglotGUI:
         self.cancel_btn.grid(row=0, column=1, sticky='ew', padx=(10, 0))
         self.cancel_btn.configure(state=tk.DISABLED)
 
-        # === 进度条 ===
+        # === 进度条 + 状态文字 ===
         prog_frame = ttk.Frame(main)
         prog_frame.grid(row=4, column=0, sticky='ew', pady=(0, 12))
         prog_frame.columnconfigure(0, weight=1)
@@ -812,12 +891,12 @@ class PolyglotGUI:
         self.progress = ttk.Progressbar(
             prog_frame, mode='determinate', style='Horizontal.TProgressbar'
         )
-        self.progress.grid(row=0, column=0, sticky='ew')
+        self.progress.grid(row=0, column=0, sticky='ew', pady=(0, 6))
 
         self.progress_lbl = ttk.Label(
             prog_frame, text='就绪', font=FONT_STATUS, foreground=C_TEXT_SEC
         )
-        self.progress_lbl.grid(row=0, column=1, padx=(12, 0))
+        self.progress_lbl.grid(row=1, column=0, sticky='w')
 
         # === 日志区 (浅色输出面板) ===
         log_outer = tk.Frame(main, bg=C_CARD, bd=1, relief='solid',
@@ -835,6 +914,13 @@ class PolyglotGUI:
                  bg='#E8E8ED', fg=C_TEXT_SEC, anchor='w').pack(
             side=tk.LEFT, padx=(8, 0), pady=(4, 0)
         )
+        # 导出日志按钮 (将日志文本另存为 .txt, 便于事后排查/反馈)
+        tk.Button(
+            log_bar, text='导出', font=(FONT_LABEL[0], 8),
+            bg='#E8E8ED', fg=C_TEXT_SEC, activebackground='#DCDCE2',
+            activeforeground=C_TEXT_SEC, relief='flat', bd=0,
+            cursor='hand2', padx=8, pady=1, command=self._export_log
+        ).pack(side=tk.RIGHT, padx=(0, 8), pady=(3, 0))
 
         # 日志文本
         self.log = tk.Text(
@@ -941,6 +1027,25 @@ class PolyglotGUI:
             pass
         self.root.after(50, self._poll_log_queue)
 
+    def _export_log(self):
+        """将日志文本另存为 .txt 文件 (便于事后排查/反馈问题)。"""
+        path = filedialog.asksaveasfilename(
+            title='导出日志',
+            defaultextension='.txt',
+            filetypes=[('文本文件', '*.txt'), ('所有文件', '*.*')],
+            initialfile=f'polyglot_log_{time.strftime("%Y%m%d_%H%M%S")}.txt',
+        )
+        if not path:
+            return
+        try:
+            content = self.log.get('1.0', tk.END)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except OSError as e:
+            messagebox.showerror('导出失败', f'无法写入日志文件:\n{e}')
+            return
+        self._log(f'日志已导出: {path}', 'success')
+
     # --------------------------------------------------------
     # 进度
     # --------------------------------------------------------
@@ -1027,9 +1132,6 @@ class PolyglotGUI:
                 if not find_ffmpeg():
                     self._log_async('未检测到 ffmpeg, 无法压缩表面视频。', 'warning')
                     self.root.after(0, self._prompt_download_ffmpeg)
-                    self.root.after(0, self._on_error,
-                                    '未检测到 ffmpeg。\n\n'
-                                    '请在弹出窗口中选择下载安装, 安装完成后重新构建。')
                     return
                 # 压缩到临时路径
                 compressed_outer = self._temp_compressed_path(outer)

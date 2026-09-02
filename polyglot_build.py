@@ -40,7 +40,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from contextlib import contextmanager
-from typing import Callable, List, Optional
+from typing import Callable, IO, List, Optional, Tuple
 
 # 进度回调签名: (phase, current, total, message) -> None
 ProgressCallback = Callable[[str, int, int, str], None]
@@ -66,17 +66,35 @@ def get_logger() -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
+def setup_logging(level: int = logging.INFO,
+                  log_file: Optional[str] = None) -> logging.Logger:
     """配置全局日志 (幂等)。CLI 与 GUI 共用此入口, 保证输出格式一致。
 
-    默认只在根 logger 挂一个带格式的 StreamHandler (stdout)。
+    默认挂一个简洁的 StreamHandler (stdout); 传入 log_file 时额外挂一个
+    FileHandler (追加模式, UTF-8, 带时间戳/级别) 将日志持久化, 便于事后排查。
+    重复调用同一 log_file 不会重复挂载。
     """
     logger = get_logger()
-    if not logger.handlers:
+    # 控制台 handler: FileHandler 也是 StreamHandler 子类, 需排除后再判断
+    has_console = any(isinstance(h, logging.StreamHandler)
+                      and not isinstance(h, logging.FileHandler)
+                      for h in logger.handlers)
+    if not has_console:
         handler = logging.StreamHandler()
         handler.setFormatter(
             logging.Formatter('%(message)s'))  # 简洁: 仅消息本身
         logger.addHandler(handler)
+    if log_file:
+        abs_path = os.path.abspath(log_file)
+        has_file = any(isinstance(h, logging.FileHandler)
+                       and os.path.abspath(h.baseFilename) == abs_path
+                       for h in logger.handlers)
+        if not has_file:
+            file_handler = logging.FileHandler(
+                log_file, mode='a', encoding='utf-8')
+            file_handler.setFormatter(
+                logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+            logger.addHandler(file_handler)
     logger.setLevel(level)
     logger.propagate = False
     return logger
@@ -121,6 +139,10 @@ ZIP64_ENTRIES_THRESHOLD = 0xFFFF    # 条目数超过 65535
 # 与阈值分离: 阈值可被测试 patch 以触发 ZIP64 路径, 而标记始终为规范值。
 ZIP64_MARKER = 0xFFFFFFFF
 
+# RAR 文件魔数 (用于构建前的有效性提示, 非强制中断)
+RAR4_MAGIC = b'Rar!\x1a\x07\x00'        # RAR 4.x
+RAR5_MAGIC = b'Rar!\x1a\x07\x01\x00'    # RAR 5.x
+
 
 class CRC32Calculator:
     """增量式 CRC-32 计算器，用于大文件流式处理"""
@@ -136,13 +158,43 @@ class CRC32Calculator:
         return self.crc & 0xFFFFFFFF
 
 
-def format_size(size_bytes):
+def format_size(size_bytes: float) -> str:
     """将字节数格式化为人类可读形式"""
     for unit in ['B', 'KB', 'MB', 'GB']:
         if abs(size_bytes) < 1024.0:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} TB"
+
+
+def _dos_datetime_from_mtime(mtime: float) -> tuple[int, int]:
+    """将文件 mtime (epoch 秒) 转为 ZIP 头用的 (DOS 时间, DOS 日期)。
+
+    DOS 时间: (时<<11) | (分<<5) | (秒//2)
+    DOS 日期: ((年-1980)<<9) | (月<<5) | 日
+    年份早于 1980 时钳制到 1980 (DOS 纪元起点)。
+    """
+    t = time.localtime(mtime)
+    year = max(t.tm_year, 1980)
+    dos_time = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
+    dos_date = ((year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
+    return dos_time, dos_date
+
+
+def _validate_rar(rar_path: str) -> Optional[str]:
+    """校验文件是否为 RAR (读魔数)。是 RAR 返回 None; 否则返回警告文本。
+
+    仅做魔数校验 (不解析加密位), 非 RAR 时给警告, 由调用方决定是否继续。
+    """
+    try:
+        with open(rar_path, 'rb') as f:
+            head = f.read(8)
+    except OSError as e:
+        return f'无法读取 RAR 文件: {e}'
+    if head.startswith(RAR5_MAGIC) or head.startswith(RAR4_MAGIC):
+        return None
+    return ('该文件不是标准 RAR (未检测到 RAR 魔数); '
+            '请确认已用 WinRAR 以 RAR 格式 (非 ZIP) 压缩并设置密码。')
 
 
 def generate_zip64_extra(uncompressed_size: int, compressed_size: int,
@@ -182,7 +234,7 @@ def generate_zip64_extra(uncompressed_size: int, compressed_size: int,
     return extra
 
 
-def build_zip64_eocd(num_entries, cd_size, cd_offset):
+def build_zip64_eocd(num_entries: int, cd_size: int, cd_offset: int) -> bytes:
     """构建 ZIP64 End of Central Directory Record"""
     size = 56  # ZIP64 EOCD 固定大小（不含可变区域）
     
@@ -216,19 +268,21 @@ def build_zip64_eocd_locator(zip64_eocd_offset: int) -> bytes:
 
 
 def build_local_header(filename_bytes: bytes, flags: int, method: int,
-                       extra_field: bytes = b'') -> bytes:
+                       extra_field: bytes = b'',
+                       dos_time: int = 0, dos_date: int = 0) -> bytes:
     """
     构建 ZIP 本地文件头
     
     当使用数据描述符时，CRC、压缩大小、未压缩大小设为 0
+    dos_time/dos_date 默认 0 (1980-00-00); 传入真实值可让条目显示合理修改时间。
     """
     return struct.pack('<IHHHHHIIIHH',
         LOCAL_HEADER_SIG,       # 签名
         20,                     # 解压版本 (2.0)
         flags,                  # 通用标志位
         method,                 # 压缩方法
-        0,                      # 修改时间 (DOS)
-        0,                      # 修改日期 (DOS)
+        dos_time,               # 修改时间 (DOS)
+        dos_date,               # 修改日期 (DOS)
         0,                      # CRC-32 (使用数据描述符时为 0)
         0,                      # 压缩后大小 (使用数据描述符时为 0)
         0,                      # 未压缩大小 (使用数据描述符时为 0)
@@ -240,7 +294,8 @@ def build_local_header(filename_bytes: bytes, flags: int, method: int,
 def build_central_dir_header(filename_bytes: bytes, flags: int, method: int, crc: int,
                              compressed_size: int, uncompressed_size: int,
                              local_header_offset: int, extra_field: bytes = b'',
-                             comment: bytes = b'') -> bytes:
+                             comment: bytes = b'',
+                             dos_time: int = 0, dos_date: int = 0) -> bytes:
     """构建 ZIP 中央目录文件头
     
     注意：大小/偏移字段使用 32-bit 阈值 (ZIP64_SIZE_THRESHOLD)，
@@ -264,8 +319,8 @@ def build_central_dir_header(filename_bytes: bytes, flags: int, method: int, crc
         version_needed,         # 解压版本
         flags,                  # 通用标志位
         method,                 # 压缩方法
-        0,                      # 修改时间 (DOS)
-        0,                      # 修改日期 (DOS)
+        dos_time,               # 修改时间 (DOS)
+        dos_date,               # 修改日期 (DOS)
         crc,                    # CRC-32
         comp_size_to_write,     # 压缩后大小 (32-bit)
         uncomp_size_to_write,   # 未压缩大小 (32-bit)
@@ -383,7 +438,7 @@ def _cancel_scope(output_path: str, outer_path: str, temp_outer: Optional[str]):
         raise
 
 
-def _stream_copy(f_in, f_out, total_size: int,
+def _stream_copy(f_in: IO[bytes], f_out: IO[bytes], total_size: int,
                  callback: Optional[ProgressCallback],
                  stop_event: Optional[threading.Event],
                  phase: str, label: str,
@@ -401,7 +456,9 @@ def _stream_copy(f_in, f_out, total_size: int,
     """
     written = 0
     read = 0
-    last_progress_time = time.time()
+    # 初始化为 0.0 使首个 chunk 立即上报一次进度 (之后按 0.2s 节流),
+    # 既改善 UX (立刻有反馈), 也保证小文件/快速拷贝至少产生一次进度回调。
+    last_progress_time = 0.0
 
     while True:
         _check_stop(stop_event)
@@ -483,14 +540,31 @@ def build_polyglot(outer_path: str, rar_path: str, output_path: str,
         )
     if callback:
         callback('info', 0, 0, f'磁盘剩余空间: {format_size(disk_free)} (充足)')
-    
+
+    # RAR 有效性 (魔数) 校验: 非标准 RAR 仅警告, 不中断
+    rar_warn = _validate_rar(rar_path)
+    if rar_warn and callback:
+        callback('info', 0, 0, f'⚠ {rar_warn}')
+
     if callback:
         method_name = 'Store (不压缩)' if method == COMP_STORED else 'Deflate'
         callback('start', 0, rar_size, f'外层文件: {outer_name} ({format_size(outer_size)})')
         callback('start', 0, rar_size, f'RAR 文件: {rar_name} ({format_size(rar_size)})')
         callback('start', 0, rar_size, f'输出文件: {output_path}')
         callback('start', 0, rar_size, f'压缩方式: {method_name}')
-    
+        # 输出体积预估 (Store 约等于两者之和; Deflate 取决于压缩率)
+        est_note = ('Store, 约等于两者之和' if method == COMP_STORED
+                    else 'Deflate, 实际取决于压缩率')
+        callback('info', 0, 0,
+                 f'预计输出体积: ≈ {format_size(outer_size + rar_size)} ({est_note})')
+
+    # ZIP 条目时间戳: 取 RAR 文件 mtime (无则用当前时间), 避免 1980-00-00 异常特征
+    try:
+        entry_mtime = os.path.getmtime(rar_path)
+    except OSError:
+        entry_mtime = time.time()
+    dos_time, dos_date = _dos_datetime_from_mtime(entry_mtime)
+
     # RAR 文件名使用 UTF-8 编码
     filename_bytes = rar_name.encode('utf-8')
     
@@ -523,22 +597,13 @@ def build_polyglot(outer_path: str, rar_path: str, output_path: str,
          open(output_path, 'wb') as f_out:
         
         # ==========================================
-        # 第一步: 复制外层文件
+        # 第一步: 复制外层文件 (统一走 _stream_copy, 首帧即报 + 0.2s 节流)
         # ==========================================
         if callback:
-            callback('copy', 0, outer_size, f'正在复制外层文件...')
+            callback('copy', 0, outer_size, '正在复制外层文件...')
 
-        copied = 0
-        while True:
-            _check_stop(stop_event)
-            chunk = f_outer.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            f_out.write(chunk)
-            copied += len(chunk)
-            if callback:
-                callback('copy', copied, outer_size,
-                        f'正在复制外层文件... {format_size(copied)} / {format_size(outer_size)}')
+        _stream_copy(f_outer, f_out, outer_size, callback, stop_event,
+                     phase='copy', label='正在复制外层文件...')
 
         local_header_offset = f_out.tell()
         
@@ -549,7 +614,8 @@ def build_polyglot(outer_path: str, rar_path: str, output_path: str,
         # ==========================================
         # 第二步: 写入 ZIP 本地文件头
         # ==========================================
-        local_header = build_local_header(filename_bytes, flags, method, zip64_extra)
+        local_header = build_local_header(filename_bytes, flags, method, zip64_extra,
+                                          dos_time=dos_time, dos_date=dos_date)
         f_out.write(local_header)
         
         # ==========================================
@@ -602,7 +668,8 @@ def build_polyglot(outer_path: str, rar_path: str, output_path: str,
         central_dir = build_central_dir_header(
             filename_bytes, flags, method,
             crc_value, compressed_size, uncompressed_size,
-            local_header_offset, cd_zip64_extra
+            local_header_offset, cd_zip64_extra,
+            dos_time=dos_time, dos_date=dos_date
         )
         f_out.write(central_dir)
         
@@ -783,13 +850,18 @@ def find_ffmpeg() -> Optional[str]:
     return shutil.which('ffmpeg')
 
 
-def ensure_ffmpeg() -> Optional[str]:
-    """确保 ffmpeg 可用。已安装则返回其路径, 否则返回 None (需下载)。
+def _safe_extractall(zf: zipfile.ZipFile, dest: str) -> None:
+    """安全解压: 校验每个成员目标路径确实落在 dest 内, 防 Zip Slip。
 
-    与 find_ffmpeg 的区别: ensure_ffmpeg 不主动下载, 只负责检测;
-    调用方据此决定是否提示用户下载。
+    含绝对路径或 .. 越界的成员直接跳过 (可信镜像通常无此情况, 属防御性加固)。
+    Python 的 ZipFile.extract 自身也会净化路径, 此处再加一层显式校验。
     """
-    return find_ffmpeg()
+    dest_abs = os.path.realpath(dest)
+    for member in zf.infolist():
+        target = os.path.realpath(os.path.join(dest, member.filename))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
+            continue
+        zf.extract(member, dest)
 
 
 def download_ffmpeg(dest_dir: Optional[str] = None,
@@ -844,10 +916,10 @@ def download_ffmpeg(dest_dir: Optional[str] = None,
     except Exception as e:
         raise OSError(f'下载 ffmpeg 失败: {e}')
 
-    # 解压
+    # 解压 (防 Zip Slip: 校验成员路径落在 dest 内)
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(dest)
+            _safe_extractall(zf, dest)
     except Exception as e:
         raise OSError(f'解压 ffmpeg 失败: {e}')
     finally:
@@ -865,14 +937,68 @@ def download_ffmpeg(dest_dir: Optional[str] = None,
     return ffmpeg
 
 
+def _find_ffprobe(ffmpeg_path: str) -> Optional[str]:
+    """由 ffmpeg 路径旁推同目录 ffprobe; 不存在则回退系统 PATH, 仍无返回 None。"""
+    exe = 'ffprobe.exe' if os.name == 'nt' else 'ffprobe'
+    p = os.path.join(os.path.dirname(ffmpeg_path), exe)
+    if os.path.isfile(p):
+        return p
+    return shutil.which('ffprobe')
+
+
+def _probe_duration(ffprobe: str, src: str) -> Optional[float]:
+    """用 ffprobe 读取媒体时长 (秒); 失败或无法解析返回 None。"""
+    try:
+        out = subprocess.run(
+            [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', src],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if out.returncode == 0:
+            return float(out.stdout.decode('utf-8', 'ignore').strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _parse_ffmpeg_time(val: str) -> Optional[float]:
+    """解析 ffmpeg 进度输出的 out_time=HH:MM:SS.micro 为秒; 失败返回 None。"""
+    try:
+        h, m, s = val.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """终止子进程: 先 terminate 并等待, 超时或异常再 kill。"""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
                    callback: Optional[ProgressCallback] = None,
                    stop_event: Optional[threading.Event] = None) -> str:
     """用 ffmpeg 压缩视频, 返回压缩后文件路径 dst。
 
     quality 取值见 VIDEO_QUALITY。ffmpeg 未安装时抛 OSError。
-    通过 callback('info', ...) 报告阶段信息。
+    通过 callback('info', ...) 报告阶段信息; 能探测到源时长时,
+    通过 callback('compress', pct, 100, ...) 报告编码进度百分比。
+
+    实现要点:
+      - `-progress pipe:1 -nostats`: ffmpeg 把 key=value 进度写到 stdout, 按行解析
+        out_time 换算百分比;
+      - stderr 重定向到临时文件而非管道: 长编码时避免 stderr 管道缓冲区写满
+        导致 ffmpeg 阻塞 (死锁), 失败时读尾部 500 字符报错;
+      - 读取每行间隙检查 stop_event, 支持取消 (terminate/kill)。
     """
+    import tempfile
+
     if quality not in VIDEO_QUALITY:
         raise ValueError(f'未知压缩档位: {quality} (可选 {list(VIDEO_QUALITY)})')
 
@@ -887,43 +1013,72 @@ def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
         callback('info', 0, 0,
                  f'正在压缩表面视频 ({quality}, {bitrate // 1000}kbps)...')
 
+    # 探测源时长用于换算进度百分比 (缺 ffprobe/探测失败时降级为无百分比)
+    ffprobe = _find_ffprobe(ffmpeg)
+    duration = _probe_duration(ffprobe, src) if ffprobe else None
+
     # 滤镜: 仅当原始高度高于 max_height 时按比例缩到该高度, 否则保持原尺寸
     # scale 宽: 高>max_height 时按比例(-2 保持偶数), 否则保持原宽(iw)
     vf = (f"scale='if(gt(ih\\,{max_height})\\,trunc(iw*{max_height}/ih/2)*2\\,iw)':"
           f"'if(gt(ih\\,{max_height})\\,{max_height}\\,ih)'")
 
     cmd = [
-        ffmpeg, '-y', '-i', src,
+        ffmpeg, '-y', '-nostats', '-i', src,
         '-c:v', 'libx264', '-preset', 'medium',
         '-b:v', str(bitrate), '-maxrate', str(int(bitrate * 1.2)),
         '-bufsize', str(int(bitrate * 2)), '-vf', vf,
         '-c:a', 'aac', '-b:a', '128k',
         '-movflags', '+faststart',
+        '-progress', 'pipe:1',
         dst,
     ]
 
+    err_fd, err_path = tempfile.mkstemp(suffix='.log', prefix='polyglot_ffmpeg_')
+    os.close(err_fd)
+    proc: Optional[subprocess.Popen] = None
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # 等待完成, 期间检查取消
-        while proc.poll() is None:
-            if stop_event is not None and stop_event.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-                raise BuildCancelled('压缩已被用户取消')
-            time.sleep(0.1)
+        with open(err_path, 'wb') as err_file:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_file)
+            assert proc.stdout is not None
+            # 按行读取 -progress 输出; 每行都检查取消
+            for raw in proc.stdout:
+                if stop_event is not None and stop_event.is_set():
+                    _terminate_proc(proc)
+                    raise BuildCancelled('压缩已被用户取消')
+                line = raw.decode('utf-8', 'ignore').strip()
+                if not line or '=' not in line:
+                    continue
+                key, _sep, val = line.partition('=')
+                if key == 'out_time' and duration and duration > 0 and callback:
+                    elapsed = _parse_ffmpeg_time(val)
+                    if elapsed is not None:
+                        pct = min(100, int(elapsed * 100 / duration))
+                        callback('compress', pct, 100,
+                                 f'正在压缩表面视频... {pct}%')
+            proc.wait()
         if proc.returncode != 0:
-            stderr = proc.stderr.read().decode('utf-8', 'ignore') if proc.stderr else ''
-            raise OSError(f'ffmpeg 压缩失败 (退出码 {proc.returncode}):\n{stderr[-500:]}')
+            stderr_tail = ''
+            try:
+                with open(err_path, 'rb') as f:
+                    stderr_tail = f.read().decode('utf-8', 'ignore')[-500:]
+            except OSError:
+                pass
+            raise OSError(
+                f'ffmpeg 压缩失败 (退出码 {proc.returncode}):\n{stderr_tail}')
     except BuildCancelled:
         raise
     except OSError:
         raise
     except Exception as e:
+        if proc is not None:
+            _terminate_proc(proc)
         raise OSError(f'ffmpeg 执行失败: {e}')
+    finally:
+        if os.path.exists(err_path):
+            try:
+                os.remove(err_path)
+            except OSError:
+                pass
 
     if callback:
         callback('info', 0, 0, '表面视频压缩完成')
@@ -935,6 +1090,103 @@ def _temp_path_for_outer(outer_path: str) -> str:
     d = os.path.dirname(os.path.abspath(outer_path))
     base = os.path.splitext(os.path.basename(outer_path))[0]
     return os.path.join(d, f'polyglot_compressed_{base}.mp4')
+
+
+def _parse_batch_manifest(path: str) -> List[Tuple[str, str, str]]:
+    """解析批量清单文件, 返回 (outer, rar, output) 三元组列表。
+
+    每行格式: outer|rar[|output]
+      - 以 '|' 分隔; 第三段 output 可选, 缺省时输出与 outer 同名;
+      - 忽略空行与以 '#' 开头的注释行; 各段自动 strip 去首尾空白。
+    文件不存在抛 IOError; 字段不足 2 个或关键字段为空的行抛 ValueError。
+    """
+    if not os.path.isfile(path):
+        raise IOError(f'批量清单文件不存在: {path}')
+    tasks: List[Tuple[str, str, str]] = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                raise ValueError(
+                    f'清单第 {lineno} 行格式非法 (需 outer|rar[|output]): {line}')
+            outer, rar = parts[0], parts[1]
+            output = parts[2] if len(parts) >= 3 and parts[2] else outer
+            tasks.append((outer, rar, output))
+    return tasks
+
+
+def _run_batch(args: argparse.Namespace, logger: logging.Logger) -> None:
+    """批量模式: 逐条构建清单任务并汇总成败。
+
+    复用单文件的压缩/构建/校验流程; 任一条失败不中断后续 (Ctrl+C 除外),
+    末尾统计成功/失败数。全部成功 sys.exit(0), 存在失败 sys.exit(1)。
+    """
+    try:
+        tasks = _parse_batch_manifest(args.batch)
+    except (IOError, ValueError) as e:
+        print(f'错误: {e}', file=sys.stderr)
+        sys.exit(1)
+
+    if not tasks:
+        print('错误: 批量清单为空, 无任务可执行', file=sys.stderr)
+        sys.exit(1)
+
+    callback = None if args.quiet else progress_callback
+    method = COMP_DEFLATE if args.deflate else COMP_STORED
+
+    logger.info('Polyglot Builder v%s - 批量模式 (%d 个任务)', VERSION, len(tasks))
+    logger.info('=' * 40)
+
+    ok = 0
+    failed: List[str] = []
+    for idx, (outer, rar, output) in enumerate(tasks, 1):
+        logger.info('[%d/%d] 处理: %s', idx, len(tasks), output)
+        compressed_outer: Optional[str] = None
+        try:
+            if not os.path.isfile(outer):
+                raise IOError(f'外层文件不存在: {outer}')
+            if not os.path.isfile(rar):
+                raise IOError(f'RAR 文件不存在: {rar}')
+
+            effective_outer = outer
+            if args.compress:
+                compressed_outer = _temp_path_for_outer(outer)
+                compress_video(outer, compressed_outer,
+                               quality=args.compress, callback=callback)
+                effective_outer = compressed_outer
+
+            if callback:
+                callback('start', 0, 0, f'外层文件: {outer}')
+                callback('start', 0, 0, f'RAR 文件: {rar}')
+                callback('start', 0, 0, f'输出文件: {output}')
+
+            build_polyglot(effective_outer, rar, output, callback, method=method)
+
+            if not args.no_verify:
+                verify_polyglot(output, callback)
+
+            ok += 1
+            logger.info('[%d/%d] ✓ 完成: %s', idx, len(tasks), output)
+        except Exception as e:  # 单条失败不阻断整批
+            failed.append(f'{outer} -> {output}: {e}')
+            logger.error('[%d/%d] ✗ 失败: %s', idx, len(tasks), e)
+        finally:
+            if compressed_outer and os.path.exists(compressed_outer):
+                try:
+                    os.remove(compressed_outer)
+                except OSError:
+                    pass
+
+    logger.info('=' * 40)
+    logger.info('批量完成: 成功 %d, 失败 %d (共 %d)', ok, len(failed), len(tasks))
+    if failed:
+        for item in failed:
+            logger.error('  失败项: %s', item)
+        sys.exit(1)
+    sys.exit(0)
 
 
 def main() -> None:
@@ -1007,6 +1259,19 @@ def main() -> None:
     )
 
     parser.add_argument(
+        '--batch',
+        metavar='MANIFEST',
+        help='批量模式: 指定清单文本文件, 每行 "外层|RAR[|输出]"; '
+             '忽略空行与 # 注释行。任一条失败不中断后续, 末尾汇总成败'
+    )
+
+    parser.add_argument(
+        '--log-file',
+        metavar='PATH',
+        help='将日志额外持久化到指定文件 (追加模式, UTF-8), 便于事后排查'
+    )
+
+    parser.add_argument(
         '--version',
         action='version',
         version=f'Polyglot Builder v{VERSION}'
@@ -1016,7 +1281,7 @@ def main() -> None:
 
     # 统一日志: CLI 与 GUI 共用
     level = logging.WARNING if args.quiet else logging.INFO
-    log = setup_logging(level)
+    log = setup_logging(level, log_file=args.log_file)
     logger = get_logger()
 
     # 如果使用 --gui 参数，启动图形界面 (在参数验证之前)
@@ -1033,11 +1298,16 @@ def main() -> None:
             print(f'错误: 无法启动图形界面: {e}', file=sys.stderr)
             sys.exit(1)
     
+    # 批量模式: 从清单读取多条任务, 在单文件参数验证之前处理
+    if args.batch:
+        _run_batch(args, logger)
+        return
+
     # 以下仅在非 GUI 模式下验证
     if not args.outer_file:
-        parser.error('外层文件路径是必需的 (或使用 --gui 启动图形界面)')
+        parser.error('外层文件路径是必需的 (或使用 --gui / --batch)')
     if not args.rar_file:
-        parser.error('RAR 文件路径是必需的 (或使用 --gui 启动图形界面)')
+        parser.error('RAR 文件路径是必需的 (或使用 --gui / --batch)')
     
     # 检查外层文件
     if not os.path.isfile(args.outer_file):
