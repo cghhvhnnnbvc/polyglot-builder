@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Polyglot Builder - 图形界面 v3.0
+Polyglot Builder - 图形界面 v1.0
 
 现代极简设计 (VS Code / Notion 风格):
   - 扁平化设计，去除所有立体边框

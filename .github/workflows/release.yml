@@ -1,0 +1,51 @@
+# 自动发版工作流: 推送 v* 标签时触发
+# 流程: 校验标签与 VERSION 一致 → 跑测试 → PyInstaller 打包 → 压缩 → 创建 Release 并上传 zip
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 防呆: 标签名必须与 polyglot_build.VERSION 常量一致 (如 v1.0 ↔ '1.0'),
+      # 防止版本号漂移 (曾发生过 bat/文档/代码版本号不一致的问题)
+      - name: 校验标签与 VERSION 常量一致
+        shell: python
+        run: |
+          import polyglot_build, os
+          tag = os.environ['GITHUB_REF_NAME']
+          ver = 'v' + polyglot_build.VERSION
+          assert tag == ver, f'标签 {tag} 与 VERSION 常量 {ver} 不一致, 请先统一版本号'
+
+      - name: 运行测试
+        run: python -m unittest test_polyglot -v
+
+      - name: 安装 PyInstaller
+        run: pip install pyinstaller
+
+      - name: 打包 (onedir)
+        run: pyinstaller --noconfirm polyglot_builder.spec
+
+      # 产物为 dist/PolyglotBuilder/ (exe + _internal/), 压缩后解压即用
+      # 注: 仓库不含 ffmpeg/ (被 .gitignore 排除), 程序运行时按需下载
+      - name: 压缩产物
+        run: Compress-Archive -Path dist/PolyglotBuilder -DestinationPath "PolyglotBuilder-${{ github.ref_name }}-windows-x64.zip"
+
+      - name: 创建 Release 并上传
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PolyglotBuilder-${{ github.ref_name }}-windows-x64.zip
+          generate_release_notes: true

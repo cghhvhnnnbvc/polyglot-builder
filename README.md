@@ -1,6 +1,12 @@
 # Polyglot Builder - 多格式文件拼接工具
 
+![CI](https://github.com/cghhvhnnnbvc/polyglot-builder/actions/workflows/ci.yml/badge.svg) ![版本](https://img.shields.io/badge/version-1.0-blue)
+
 将媒体/文档文件与加密 RAR 压缩包拼接为"多格式文件"——既是正常可播放的视频/图片/文档，改后缀名后又是可解压的 ZIP 压缩包。
+
+## 下载
+
+到 [Releases](https://github.com/cghhvhnnnbvc/polyglot-builder/releases) 下载 `PolyglotBuilder-vX.Y.Z-windows-x64.zip`，解压后**双击 `PolyglotBuilder.exe`** 即可（无需 Python 环境）。
 
 ## 功能
 
@@ -22,6 +28,7 @@
 | `polyglot_builder.spec` | PyInstaller 打包配置 (onedir, 可选) |
 | `build_dist.bat` | 一键打包脚本 (装 PyInstaller → 跑测试 → 打包, 可选) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (mypy + unittest 多平台矩阵) |
+| `.github/workflows/release.yml` | 自动发版 (推送 v* 标签即自动打包并发布到 Releases) |
 
 ## 安装要求
 
@@ -216,47 +223,20 @@ pyinstaller --noconfirm polyglot_builder.spec
 
 持续集成: 仓库含 `.github/workflows/ci.yml`, 在 push/PR 时于 Windows + Ubuntu × Python 3.10/3.12 矩阵自动跑 mypy 类型检查与 unittest (Linux 经 xvfb 实跑 GUI 用例)。
 
+自动发版: 仓库含 `.github/workflows/release.yml`, 推送 `v*` 标签 (如 `git tag v1.0 && git push origin v1.0`) 即触发——自动校验标签与 `VERSION` 常量一致、跑测试、PyInstaller 打包、压缩为 zip, 并创建 GitHub Release 附上 `PolyglotBuilder-vX.Y.Z-windows-x64.zip`。
+
 ## 版本更新记录
 
-### v3.0 (2026-07-26)
-- **版本号统一**: 运行时代码、GUI、启动器与本文档统一标记为 v3.0，消除历史版本号混乱 (此前 bat 标 v2.0、本文档标 v2.2)
-- **CLI 增强**: 加 `--version`、`-y/--force` (非交互覆盖, 适合 CI)、`--compress [QUALITY]` (压缩外层视频)、`--batch MANIFEST` (批量构建)、`--log-file PATH` (日志持久化)；Ctrl+C 干净取消并清理半成品 (退出码 130)
-- **GUI 可取消构建**: 新增红色"取消"按钮, 构建中可中止并自动恢复/清理半成品输出；`RoundedButton` 支持自定义悬停/按下色
-- **双击直达 GUI**: 无参数运行 (含双击打包版 exe) 自动进入图形界面; 打包改用 GUI 子系统 (`console=False`) 彻底消除双击时的黑色控制台闪烁; Windows 专用 ctypes 代码加 `sys.platform` 守卫, 使 mypy 在 Linux (CI ubuntu 矩阵) 亦通过
-- **ZIP64 路径修复**: 修复 `build_zip64_eocd_locator` 格式 (`<IQQ` → `<IIQI`, 此前 >4GB 文件直接崩溃)；分离 `ZIP64_MARKER` 与阈值使 ZIP64 路径可测；本地头 extra 不再误含 offset 字段
-- **ZIP64 数据描述符**: 修复字段顺序 (`<IQQQ` → `<IIQQ`, signature→CRC→compressed→uncompressed)；Deflate 模式下本地头 compressed 传 0 不写未知值
-- **临时文件异常安全**: 清理改用 `_auto_remove` / `_cancel_scope` contextmanager, 构建异常或取消时也清理
-- **流式循环重构**: 抽取 `_stream_copy` 统一复制外层/Deflate/Store 三段循环, 均带 0.2s 进度节流 (首帧即报)
-- **校验进度**: `verify_polyglot` 改为分块流式 CRC 校验, 大文件校验时不再 UI 假死
-- **类型注解**: 核心函数补充类型注解 (基于 `from __future__ import annotations`)
-- **视频压缩真实进度**: `compress_video` 改用 `-progress pipe:1 -nostats` 按行解析 `out_time` 上报百分比; stderr 重定向到临时文件修复长编码管道写满导致的死锁隐患
-- **安全加固**: ffmpeg 下载解压改用 `_safe_extractall` 防 Zip Slip (校验 realpath 落在目标目录内)
-- **隐蔽性增强**: ZIP 条目写入真实 DOS 时间戳 (取自 RAR 的 mtime, 避免 1980-00-00 异常特征); 构建前预估输出体积; `_validate_rar` 校验 RAR 魔数 (非 RAR 仅警告不中断)
-- **日志持久化**: CLI `--log-file` 挂 FileHandler (追加/UTF-8/带时间戳级别); GUI 日志区新增"导出"按钮另存为 .txt
-- **打包分发**: 新增 `polyglot_builder.spec` (PyInstaller onedir, 条件内置 ffmpeg) 与 `build_dist.bat` 一键打包脚本
-- **测试与质量**: 新增 `test_polyglot.py` (unittest, 零依赖, 69 用例) 守护数据描述符/端到端轮转/ZIP64 边界/取消/CLI 分发 (--compress/--gui/--batch)/verify 正负/输出对话框/自动同步/版本一致性/进度解析/DOS 时间戳/RAR 校验/日志持久化；测试即发现并修复了两个 ZIP64 真实 bug
-- **仓库规范**: 新增 `.gitignore` (排除 `__pycache__/` `*.pyc` `build/` `dist/` 等)、`LICENSE` (MIT) 与 `.github/workflows/ci.yml` (Windows+Ubuntu × py3.10/3.12 矩阵跑 mypy + unittest)
+### v1.0 (2026-09-02) — 首个公开发布版本
 
-### v2.2 (2026-07-26)
-- **UI 全面升级**: 窗口默认从 680×560 扩大到 880×700, 所有字号全面提升 (标题 24px / 标签 14px / 按钮 16px 等)
-- **输出文件名自定义**: 新增"另存为..."对话框, 可自由选择保存位置和自定义文件名
-- **纵向拉伸优化**: 布局改用 grid + row weight, 窗口拉伸时只有日志区纵向扩展, 文件区/按钮/进度条保持固定
-- **文件选择卡片化**: 文件选择区带分组边框和更大 padding, 视觉层次更清晰
+- **核心功能**: 将媒体/文档文件 (MP4/JPG/PDF/MP3/BMP) 与 AES-256 加密 RAR 拼接为“一文件两用”的 polyglot 文件——可正常播放/打开，改后缀为 `.zip` 又可解压
+- **CLI**: `-y/--force` (非交互覆盖)、`--compress [high/medium/low]` (压缩外层视频, 需 ffmpeg)、`--batch MANIFEST` (批量构建)、`--log-file` (日志持久化)、`--deflate`、`--no-verify`、`--version`; Ctrl+C 干净取消并自动清理半成品
+- **GUI**: tkinter 零依赖; 实时进度条与彩色分级日志、构建中可取消并恢复半成品、输出路径自定义、日志导出 `.txt`; 无参数运行 (含双击打包版 exe) 直达 GUI
+- **大文件**: 8MB 分块流式处理, 内存占用恒定; 超过 4GB 自动 ZIP64 (数据描述符字段序已修复验证); ZIP 条目写入真实 DOS 时间戳 (取自 RAR mtime)
+- **健壮性**: 构建后自动流式 CRC 校验 (大文件不卡 UI); 临时文件异常安全清理; ffmpeg 下载解压防 Zip Slip; 构建前预估输出体积与 RAR 魔数校验
+- **质量与分发**: unittest 零依赖测试 (71 用例) + mypy 类型检查 + GitHub Actions CI (Windows/Ubuntu × Python 3.10/3.12 矩阵); PyInstaller onedir 打包 (`console=False`, 双击 exe 无黑色控制台闪烁)
 
-### v2.1 (2026-07-26)
-- 增加 `--gui` 图形界面入口 (基于 tkinter, 零依赖)
-- 三种方式启动 GUI: `polyglot_build.bat` (无参数)、`polyglot_build.py --gui`、双击 `启动GUI.bat`
-- GUI 包含: 三个文件选择器 (对应格式过滤)、实时进度条、深色日志面板 (彩色分级高亮)
-- 构建过程在后台线程执行, UI 不卡顿
-
-### v2.0 (2026-07-26)
-- 首个公开版本
-- 支持命令行模式
-- 支持大文件流式处理 (8MB 分块)
-- 自动 ZIP64 (超过 4GB)
-- 数据描述符 (Data Descriptor) 支持
-- 修复 EOCD 中央目录偏移截断 Bug (混用 16-bit 和 32-bit 阈值)
-- 修复输出与输入相同路径时的截断问题 (增加临时文件保护)
+> v1.0 之前的内部开发迭代 (v2.0~v3.0, 2026-07-26 同日完成) 已合并至本条目, 不再单独记录。
 
 ## 安全提示
 
