@@ -22,7 +22,7 @@ Polyglot Builder - 多格式文件拼接工具
   python polyglot_build.py video.mp4 game.rar
   python polyglot_build.py photo.jpg secret.rar -o output.jpg
 
-作者: CatPaw (美团)
+作者: feng
 日期: 2026-07-26
 """
 
