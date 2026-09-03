@@ -9,6 +9,7 @@
 """
 
 import os
+import json
 import shutil
 import struct
 import sys
@@ -19,6 +20,8 @@ import unittest
 import urllib.error
 import urllib.request
 import zipfile
+from unittest import mock
+from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import polyglot_build
@@ -30,7 +33,14 @@ from polyglot_build import (
     VIDEO_QUALITY,
     COMP_STORED, COMP_DEFLATE, ZIP64_SIZE_THRESHOLD, BuildCancelled,
 )
-from polyglot_gui import get_output_save_options, _should_follow_outer, PolyglotGUI
+from polyglot_gui import (get_output_save_options, _should_follow_outer,
+                          PolyglotGUI, LedgerRecordDialog, LedgerManagerDialog,
+                          messagebox)
+import polyglot_gui
+import polyglot_ledger
+from polyglot_ledger import (LedgerError, LedgerRecord, append_record,
+                             create_ledger, load_records, open_ledger,
+                             save_records)
 
 
 class TestDataDescriptor(unittest.TestCase):
@@ -1164,6 +1174,623 @@ class TestBatchMode(unittest.TestCase):
         self.assertEqual(code, 1, err)
         # 第一条仍应成功产出
         self.assertTrue(os.path.exists(out1))
+
+
+class TestLedger(unittest.TestCase):
+    """守护资源台账 (JSON 数据源 + 自动生成 HTML 查看页) 的读写与容错。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, '资源台账.json')
+        self.view = polyglot_ledger.html_view_path(self.path)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_legacy_html(self, html_path, payload='[]'):
+        """造一个旧版单文件 HTML 台账 (仅含数据块, 用于迁移测试)。"""
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write('<!DOCTYPE html><html><body>旧版台账'
+                    '<script id="ledger-data" type="application/json">'
+                    + payload +
+                    '</script></body></html>')
+
+    def test_create_makes_json_and_html_view(self):
+        create_ledger(self.path)
+        self.assertTrue(os.path.isfile(self.path), '应生成 JSON 数据文件')
+        self.assertTrue(os.path.isfile(self.view), '应同时生成 HTML 查看页')
+        self.assertEqual(load_records(self.path), [])
+
+    def test_json_is_source_of_truth(self):
+        """手改 JSON 应被读到, 且保存时 HTML 查看页跟着重生。"""
+        create_ledger(self.path)
+        with open(self.view, 'w', encoding='utf-8') as f:
+            f.write('<html>现查看页已过期</html>')
+        rec = LedgerRecord(name='手改JSON', filename='x.mp4')
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump({'version': 1, 'records': [asdict(rec)]},
+                      f, ensure_ascii=False)
+        got = load_records(self.path)
+        self.assertEqual([r.name for r in got], ['手改JSON'])
+        # 重新保存 -> 查看页由 JSON 重建, 过期内容被覆盖
+        save_records(self.path, got)
+        with open(self.view, encoding='utf-8') as f:
+            self.assertNotIn('已过期', f.read())
+
+    def test_html_view_deletable_and_regenerated(self):
+        """查看页是衍生物: 删了也不影响数据, 打开时自动重建。"""
+        append_record(self.path, LedgerRecord(name='保留'))
+        os.remove(self.view)
+        self.assertEqual(load_records(self.path)[0].name, '保留')
+        with mock.patch.object(polyglot_ledger.webbrowser, 'open') as browser:
+            open_ledger(self.path)
+        self.assertTrue(os.path.isfile(self.view), '查看页应被重建')
+        browser.assert_called_once()
+
+    def test_append_roundtrip_unicode(self):
+        rec = LedgerRecord(name='某游戏整合包', filename='game.mp4', size='1.5 GB',
+                           date='2026-09-03 10:00', netdisk='百度网盘',
+                           netdisk_path='/我的资源/2026', share_link='https://x/y',
+                           share_code='ab12', rar_password='密码P@ss',
+                           note='含中文与符号 "\'<>')
+        append_record(self.path, rec)
+        got = load_records(self.path)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0], rec)
+
+    def test_append_twice_keeps_order(self):
+        append_record(self.path, LedgerRecord(name='A', filename='a.mp4'))
+        append_record(self.path, LedgerRecord(name='B', filename='b.mp4'))
+        got = load_records(self.path)
+        self.assertEqual([r.name for r in got], ['A', 'B'])
+
+    def test_script_close_tag_escaped_in_view_only(self):
+        """值里的 </script> 不得提前闭合查看页数据块; JSON 数据源保持原样。"""
+        append_record(self.path, LedgerRecord(name='x</script><b>y', note='</script>'))
+        with open(self.view, encoding='utf-8') as f:
+            html = f.read()
+        self.assertEqual(html.count('<script id="ledger-data"'), 1)
+        with open(self.path, encoding='utf-8') as f:
+            raw = f.read()
+        self.assertIn('x</script><b>y', raw, 'JSON 数据源不应被转义污染')
+        got = load_records(self.path)
+        self.assertEqual(got[0].name, 'x</script><b>y')
+        self.assertEqual(got[0].note, '</script>')
+
+    def test_append_creates_missing_ledger(self):
+        self.assertFalse(os.path.isfile(self.path))
+        append_record(self.path, LedgerRecord(name='auto'))
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual(load_records(self.path)[0].name, 'auto')
+
+    def test_no_tmp_file_left_behind(self):
+        """原子写入不应残留 .tmp 文件。"""
+        append_record(self.path, LedgerRecord(name='A'))
+        leftovers = [n for n in os.listdir(self.tmpdir) if n.endswith('.tmp')]
+        self.assertEqual(leftovers, [])
+
+    def test_load_missing_ledger_raises(self):
+        with self.assertRaises(LedgerError):
+            load_records(os.path.join(self.tmpdir, 'nope.json'))
+
+    def test_load_corrupt_json_raises(self):
+        create_ledger(self.path)
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write('{坏数据')
+        with self.assertRaises(LedgerError):
+            load_records(self.path)
+
+    def test_legacy_html_migration(self):
+        """旧版单文件 HTML 台账: 自动转 JSON + 旧文件改名 .bak + 生成新查看页。"""
+        legacy = json.dumps([{'name': '旧资源', 'filename': 'old.mp4',
+                              'size': '3 MB', 'date': '2026-08-01 09:00',
+                              'netdisk': '夸克网盘', 'netdisk_path': '/旧',
+                              'share_link': '', 'share_code': '',
+                              'rar_password': 'oldpw', 'note': ''}],
+                            ensure_ascii=False)
+        self._write_legacy_html(self.view, legacy)
+        self.assertFalse(os.path.isfile(self.path))
+
+        got = load_records(self.path)
+        self.assertEqual([r.name for r in got], ['旧资源'])
+        self.assertEqual(got[0].rar_password, 'oldpw')
+        self.assertTrue(os.path.isfile(self.path), '应生成 JSON 数据文件')
+        self.assertTrue(os.path.isfile(self.view + '.bak'), '旧 HTML 应保留为 .bak')
+        with open(self.view, encoding='utf-8') as f:
+            self.assertIn('旧资源', f.read(), '应生成新查看页')
+
+    def test_legacy_html_path_argument_migrates(self):
+        """传入旧版 .html 路径也能用 (规范化 + 迁移)。"""
+        self._write_legacy_html(
+            self.view, json.dumps([{'name': '从 HTML 路径读'}], ensure_ascii=False))
+        got = load_records(self.view)
+        self.assertEqual(got[0].name, '从 HTML 路径读')
+        self.assertTrue(os.path.isfile(self.path))
+
+    def test_legacy_html_without_data_block_raises(self):
+        self._write_legacy_html(self.view, '')
+        with open(self.view, 'w', encoding='utf-8') as f:
+            f.write('<html><body>不是台账</body></html>')
+        with self.assertRaises(LedgerError):
+            load_records(self.path)
+
+    def test_html_view_contains_viewer_features(self):
+        create_ledger(self.path)
+        with open(self.view, encoding='utf-8') as f:
+            html = f.read()
+        for needle in ('charset="utf-8"', 'ledger-data', '导出 CSV',
+                       '全部网盘', 'RAR 密码', '明文存储'):
+            self.assertIn(needle, html, f'查看页缺少: {needle}')
+
+    def test_save_records_overwrites_whole_ledger(self):
+        append_record(self.path, LedgerRecord(name='old'))
+        save_records(self.path, [LedgerRecord(name='new')])
+        got = load_records(self.path)
+        self.assertEqual([r.name for r in got], ['new'])
+
+    def test_normalize_and_view_paths(self):
+        self.assertEqual(polyglot_ledger.normalize_ledger_path('a.html'), 'a.json')
+        self.assertEqual(polyglot_ledger.normalize_ledger_path('a.JSON'), 'a.JSON')
+        self.assertEqual(polyglot_ledger.html_view_path('d\\a.html'), 'd\\a.html')
+        self.assertEqual(polyglot_ledger.html_view_path('d\\a.json'), 'd\\a.html')
+
+    def test_default_ledger_path_uses_ledger_filename(self):
+        self.assertEqual(os.path.basename(polyglot_ledger.default_ledger_path()),
+                         polyglot_ledger.LEDGER_FILENAME)
+        self.assertTrue(polyglot_ledger.default_ledger_path().endswith('.json'))
+
+    def test_config_path_roundtrip(self):
+        from unittest import mock
+        with mock.patch.object(polyglot_ledger, 'default_ledger_path',
+                               return_value=self.path):
+            self.assertIsNone(polyglot_ledger.load_configured_path())
+            other = os.path.join(self.tmpdir, 'other.json')
+            create_ledger(other)
+            polyglot_ledger.save_configured_path(other)
+            self.assertEqual(polyglot_ledger.load_configured_path(), other)
+            self.assertEqual(polyglot_ledger.resolve_ledger_path(), other)
+
+    def test_config_stores_normalized_json_path(self):
+        from unittest import mock
+        with mock.patch.object(polyglot_ledger, 'default_ledger_path',
+                               return_value=self.path):
+            create_ledger(self.path)
+            polyglot_ledger.save_configured_path(self.view)  # 传 .html
+            self.assertEqual(polyglot_ledger.load_configured_path(), self.path)
+
+    def test_resolve_falls_back_when_configured_path_gone(self):
+        from unittest import mock
+        with mock.patch.object(polyglot_ledger, 'default_ledger_path',
+                               return_value=self.path):
+            polyglot_ledger.save_configured_path(
+                os.path.join(self.tmpdir, 'deleted.json'))
+            # 记住的路径已不存在 -> 回退到默认位置
+            self.assertEqual(polyglot_ledger.resolve_ledger_path(), self.path)
+
+
+class TestLedgerCLI(unittest.TestCase):
+    """守护 CLI --ledger 记账行为。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        # 避免测试往仓库目录写 ledger_config.json
+        patcher = mock.patch.object(polyglot_ledger, 'save_configured_path')
+        self.mock_save_cfg = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_file(self, name, content):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def _run_main(self, argv):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), \
+                redirect_stdout(buf_out), redirect_stderr(buf_err):
+            try:
+                polyglot_build.main()
+                exit_code = 0
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+        return exit_code, buf_out.getvalue(), buf_err.getvalue()
+
+    def _build(self, extra_args=()):
+        outer = self._make_file('outer.bin', b'OUTER' * 50)
+        rar = self._make_file('data.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'output.bin')
+        ledger = os.path.join(self.tmpdir, '台账.json')
+        argv = ['polyglot_build.py', outer, rar, '-o', out, '-q',
+                '--ledger', ledger] + list(extra_args)
+        code, _o, err = self._run_main(argv)
+        self.assertEqual(code, 0, err)
+        return ledger, out
+
+    def test_ledger_records_build(self):
+        ledger, out = self._build()
+        recs = load_records(ledger)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].filename, os.path.basename(out))
+        self.assertTrue(recs[0].size)
+        self.assertTrue(recs[0].date)
+        self.assertEqual(recs[0].rar_password, '', '静默模式不应询问密码')
+
+    def test_ledger_fields_from_args(self):
+        ledger, _out = self._build([
+            '--ledger-name', '测试资源', '--ledger-netdisk', '夸克网盘',
+            '--ledger-location', '/资源/2026', '--note', '备注文本'])
+        rec = load_records(ledger)[0]
+        self.assertEqual(rec.name, '测试资源')
+        self.assertEqual(rec.netdisk, '夸克网盘')
+        self.assertEqual(rec.netdisk_path, '/资源/2026')
+        self.assertEqual(rec.note, '备注文本')
+
+    def test_ledger_name_defaults_to_filename(self):
+        ledger, out = self._build()
+        self.assertEqual(load_records(ledger)[0].name,
+                         os.path.basename(out))
+
+    def test_no_ledger_flag_leaves_no_file(self):
+        outer = self._make_file('o.bin', b'OUTER' * 50)
+        rar = self._make_file('r.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'o_out.bin')
+        code, _o, err = self._run_main(
+            ['polyglot_build.py', outer, rar, '-o', out, '-q'])
+        self.assertEqual(code, 0, err)
+        leftovers = [n for n in os.listdir(self.tmpdir)
+                     if n.endswith(('.html', '.json'))]
+        self.assertEqual(leftovers, [], '未指定 --ledger 时不应产生台账文件')
+
+    def test_legacy_html_ledger_arg_migrates(self):
+        """--ledger 传旧版 .html 路径: 应规范化为 .json 并生成查看页。"""
+        outer = self._make_file('o3.bin', b'OUTER' * 50)
+        rar = self._make_file('r3.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'o3_out.bin')
+        legacy = os.path.join(self.tmpdir, '台账.html')
+        code, _o, err = self._run_main(
+            ['polyglot_build.py', outer, rar, '-o', out, '-q',
+             '--ledger', legacy, '--ledger-name', '旧路径'])
+        self.assertEqual(code, 0, err)
+        json_path = os.path.join(self.tmpdir, '台账.json')
+        self.assertTrue(os.path.isfile(json_path), '应写入规范化后的 JSON')
+        self.assertEqual(load_records(json_path)[0].name, '旧路径')
+
+    def test_ledger_write_failure_does_not_break_build(self):
+        # 台账路径指向一个目录 -> 写入失败, 但构建仍应成功
+        outer = self._make_file('o2.bin', b'OUTER' * 50)
+        rar = self._make_file('r2.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'o2_out.bin')
+        bad_ledger = os.path.join(self.tmpdir, 'adir.json')
+        os.makedirs(bad_ledger)
+        code, _o, err = self._run_main(
+            ['polyglot_build.py', outer, rar, '-o', out, '-q',
+             '--ledger', bad_ledger])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(out))
+
+
+class TestLedgerGUI(unittest.TestCase):
+    """守护 GUI 台账入口与记账对话框。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _root(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        self.addCleanup(root.destroy)
+        return root
+
+    def test_dialog_save_builds_record(self):
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='a.mp4', size='10 MB',
+                                 date='2026-09-03 10:00')
+        dlg._vars['name'].set('  资源A  ')
+        dlg._vars['netdisk'].set('百度网盘')
+        dlg._vars['netdisk_path'].set('/dir')
+        dlg._vars['rar_password'].set('pw123')
+        dlg._on_save()
+        self.assertIsNotNone(dlg.record)
+        self.assertEqual(dlg.record.name, '资源A', '应去除首尾空白')
+        self.assertEqual(dlg.record.filename, 'a.mp4')
+        self.assertEqual(dlg.record.size, '10 MB')
+        self.assertEqual(dlg.record.date, '2026-09-03 10:00')
+        self.assertEqual(dlg.record.rar_password, 'pw123')
+
+    def test_dialog_cancel_yields_none(self):
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='b.mp4', size='1 MB', date='x')
+        dlg._on_cancel()
+        self.assertIsNone(dlg.record)
+
+    def test_dialog_prefills_build_output_as_editable(self):
+        """构建产物三项应为可编辑输入框的预填值, 而非只读展示。"""
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='a.mp4', size='10 MB',
+                                 date='2026-09-03 10:00')
+        self.assertEqual(dlg._vars['filename'].get(), 'a.mp4')
+        self.assertEqual(dlg._vars['size'].get(), '10 MB')
+        self.assertEqual(dlg._vars['date'].get(), '2026-09-03 10:00')
+        # 可改: 手改文件名后应被保存
+        dlg._vars['filename'].set('renamed.mp4')
+        dlg._on_save()
+        self.assertEqual(dlg.record.filename, 'renamed.mp4')
+
+    def test_dialog_manual_add_can_fill_filename(self):
+        """从管理窗口手动新增 (无构建产物) 时, 文件名应可填写并保存。"""
+        root = self._root()
+        dlg = LedgerRecordDialog(root, date='2026-09-03 12:00')
+        self.assertEqual(dlg._vars['filename'].get(), '')
+        dlg._vars['name'].set('手动录入的资源')
+        dlg._vars['filename'].set('manual.mkv')
+        dlg._vars['size'].set('3.3 GB')
+        dlg._on_save()
+        self.assertEqual(dlg.record.filename, 'manual.mkv')
+        self.assertEqual(dlg.record.size, '3.3 GB')
+        self.assertEqual(dlg.record.name, '手动录入的资源')
+        self.assertEqual(dlg.record.date, '2026-09-03 12:00')
+
+    def test_dialog_untouched_fields_stay_empty(self):
+        """未填写的字段必须是空字符串, 不能被存成提示文字。"""
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='a.mp4', size='1 MB',
+                                 date='2026-09-03 10:00')
+        dlg._vars['name'].set('只填名称')
+        dlg._on_save()
+        for key in ('netdisk_path', 'share_link', 'share_code',
+                    'rar_password', 'note', 'netdisk'):
+            self.assertEqual(getattr(dlg.record, key), '',
+                             f'{key} 不应被填入提示文字')
+
+    def test_dialog_date_autofilled_when_left_empty(self):
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='a.mp4', size='1 MB')
+        dlg._on_save()
+        self.assertTrue(dlg.record.date, '记录时间留空时应自动填当前时间')
+
+    def test_dialog_edit_prefills_every_field(self):
+        root = self._root()
+        rec = LedgerRecord(name='旧名', filename='old.mp4', size='2 MB',
+                           date='2026-01-01 08:00', netdisk='夸克网盘',
+                           netdisk_path='/旧路径', share_link='https://x',
+                           share_code='c1', rar_password='pw', note='备注')
+        dlg = LedgerRecordDialog(root, record=rec)
+        for key in ('name', 'filename', 'size', 'date', 'netdisk',
+                    'netdisk_path', 'share_link', 'share_code',
+                    'rar_password', 'note'):
+            self.assertEqual(dlg._vars[key].get(), getattr(rec, key),
+                             f'编辑时 {key} 应回填')
+        dlg._vars['filename'].set('new.mp4')
+        dlg._on_save()
+        self.assertEqual(dlg.record.filename, 'new.mp4')
+        self.assertEqual(dlg.record.rar_password, 'pw', '未改动的字段应保留')
+
+    def test_entry_value_treats_placeholder_as_empty(self):
+        """PlaceholderEntry 会把占位文字写进变量, _entry_value 必须识别并视为空。"""
+        import tkinter as tk
+        root = self._root()
+        var = tk.StringVar(master=root)
+        entry = polyglot_gui.PlaceholderEntry(root, placeholder='选择文件',
+                                              textvariable=var)
+        self.assertEqual(var.get(), '选择文件', '前提: 占位文字确实会写进变量')
+        self.assertEqual(PolyglotGUI._entry_value(var, entry), '',
+                         '仅显示占位提示时应视为未填写')
+        entry.set('D:/a.mp4')
+        self.assertEqual(PolyglotGUI._entry_value(var, entry), 'D:/a.mp4')
+
+    def test_start_build_warns_when_no_file_selected(self):
+        """未选文件就点开始构建: 应提示"请选择外层文件"而非"文件不存在"。"""
+        root = self._root()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        with mock.patch.object(messagebox, 'showwarning') as warn, \
+                mock.patch.object(messagebox, 'showerror') as err:
+            gui._start_build()
+        warn.assert_called_once()
+        self.assertIn('请选择外层文件', warn.call_args[0][1])
+        err.assert_not_called()
+
+    def test_dialog_writes_to_ledger_file(self):
+        root = self._root()
+        dlg = LedgerRecordDialog(root, filename='c.mp4', size='2 MB',
+                                 date='2026-09-03 11:00')
+        dlg._vars['name'].set('资源C')
+        dlg._vars['rar_password'].set('pwC')
+        dlg._on_save()
+        path = os.path.join(self.tmpdir, '台账.json')
+        append_record(path, dlg.record)
+        recs = load_records(path)
+        self.assertEqual(recs[0].name, '资源C')
+        self.assertEqual(recs[0].rar_password, 'pwC')
+
+    def test_main_window_has_ledger_button(self):
+        root = self._root()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        self.assertTrue(hasattr(gui, 'ledger_btn'))
+        self.assertTrue(hasattr(gui, '_open_ledger'))
+        self.assertTrue(hasattr(gui, '_prompt_ledger_record'))
+
+    def test_ledger_button_sits_in_header_row(self):
+        """台账按钮应在标题行右侧, 不再挤在构建按钮行。"""
+        root = self._root()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        info = gui.ledger_btn.grid_info()
+        # grid_info 返回值在不同 Tk 版本可能是 int 或 str, 统一转字符串比较
+        self.assertEqual(str(info['row']), '0', '应位于标题行 (row 0)')
+        self.assertEqual(str(info['column']), '1', '应右对齐于标题行第二列')
+        # 台账按钮与构建按钮不同容器: 不再挤在构建按钮行里
+        # (注: grid_info 的 row 是相对父容器的, 不能直接比较行号)
+        self.assertIsNot(gui.ledger_btn.master, gui.build_btn.master,
+                         '台账按钮应与构建按钮分属不同容器')
+        self.assertIsNot(gui.ledger_btn.master, gui.cancel_btn.master)
+
+    def test_ledger_button_uses_high_contrast_colors(self):
+        """台账按钮用浅蓝底+蓝字, 不再是对比不足的中灰底白字。"""
+        root = self._root()
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        self.assertEqual(gui.ledger_btn._bg, polyglot_gui.C_LEDGER)
+        self.assertEqual(gui.ledger_btn._fg, polyglot_gui.C_PRIMARY)
+        self.assertNotEqual(gui.ledger_btn._bg, '#8E8E93')
+
+    def test_on_success_offers_ledger_recording(self):
+        root = self._root()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        out = os.path.join(self.tmpdir, 'done.bin')
+        with open(out, 'wb') as f:
+            f.write(b'X' * 100)
+        with mock.patch.object(messagebox, 'showinfo'), \
+                mock.patch.object(messagebox, 'askyesno', return_value=True), \
+                mock.patch.object(gui, '_prompt_ledger_record') as prompt:
+            gui._on_success(out)
+        prompt.assert_called_once()
+        self.assertEqual(prompt.call_args[0][0], out)
+
+    def test_on_success_skip_ledger_when_declined(self):
+        root = self._root()
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        out = os.path.join(self.tmpdir, 'done2.bin')
+        with open(out, 'wb') as f:
+            f.write(b'X' * 100)
+        with mock.patch.object(messagebox, 'showinfo'), \
+                mock.patch.object(messagebox, 'askyesno', return_value=False), \
+                mock.patch.object(gui, '_prompt_ledger_record') as prompt:
+            gui._on_success(out)
+        prompt.assert_not_called()
+
+
+class TestLedgerManagerGUI(unittest.TestCase):
+    """守护台账管理窗口的列表/搜索/新增/编辑/删除。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, '资源台账.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _root(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        self.addCleanup(root.destroy)
+        return root
+
+    def _manager(self, records=()):
+        for r in records:
+            append_record(self.path, r)
+        mgr = LedgerManagerDialog(self._root(), self.path)
+        self.addCleanup(mgr.destroy)
+        return mgr
+
+    @staticmethod
+    def _fake_dialog(result):
+        """记账对话框替身: 不弹窗, 直接给出预设结果。"""
+        class _Fake:
+            def __init__(self, parent, **kw):
+                self.record = result
+
+            def grab_set(self):
+                pass
+        return _Fake
+
+    def test_lists_all_records(self):
+        mgr = self._manager([LedgerRecord(name='A', filename='a.mp4'),
+                             LedgerRecord(name='B', filename='b.mp4')])
+        self.assertEqual(len(mgr.tree.get_children()), 2)
+        self.assertIn('共 2 条', mgr._status_lbl.cget('text'))
+
+    def test_search_filters_rows(self):
+        mgr = self._manager([LedgerRecord(name='游戏包', netdisk='百度网盘'),
+                             LedgerRecord(name='电影', netdisk='夸克网盘')])
+        mgr._query.set('夸克')
+        self.assertEqual(len(mgr.tree.get_children()), 1)
+        mgr._query.set('')
+        self.assertEqual(len(mgr.tree.get_children()), 2)
+        mgr._query.set('zzz')
+        self.assertEqual(len(mgr.tree.get_children()), 0)
+
+    def test_add_appends_and_persists(self):
+        mgr = self._manager([LedgerRecord(name='old')])
+        new = LedgerRecord(name='新增资源', filename='n.mp4', size='1 MB',
+                           date='2026-09-03 10:00', rar_password='pw')
+        with mock.patch('polyglot_gui.LedgerRecordDialog', self._fake_dialog(new)), \
+                mock.patch.object(mgr, 'wait_window'):
+            mgr._on_add()
+        recs = load_records(self.path)
+        self.assertEqual([r.name for r in recs], ['old', '新增资源'])
+        self.assertEqual(recs[1].rar_password, 'pw')
+
+    def test_edit_updates_selected_record(self):
+        mgr = self._manager([LedgerRecord(name='A', filename='a.mp4'),
+                             LedgerRecord(name='B', filename='b.mp4')])
+        mgr.tree.selection_set(mgr.tree.get_children()[1])
+        edited = LedgerRecord(name='B-已改', filename='b2.mp4', size='9 MB',
+                              date='2026-09-03 11:00', netdisk='阿里云盘',
+                              rar_password='newpw')
+        with mock.patch('polyglot_gui.LedgerRecordDialog',
+                        self._fake_dialog(edited)), \
+                mock.patch.object(mgr, 'wait_window'):
+            mgr._on_edit()
+        recs = load_records(self.path)
+        self.assertEqual([r.name for r in recs], ['A', 'B-已改'])
+        self.assertEqual(recs[1].netdisk, '阿里云盘')
+        self.assertEqual(recs[1].rar_password, 'newpw')
+
+    def test_edit_without_selection_is_noop(self):
+        mgr = self._manager([LedgerRecord(name='A')])
+        with mock.patch.object(messagebox, 'showinfo') as info:
+            mgr._on_edit()
+        info.assert_called_once()
+        self.assertEqual(len(load_records(self.path)), 1)
+
+    def test_delete_removes_selected_record(self):
+        mgr = self._manager([LedgerRecord(name='A'), LedgerRecord(name='B')])
+        mgr.tree.selection_set(mgr.tree.get_children()[0])
+        with mock.patch.object(messagebox, 'askyesno', return_value=True):
+            mgr._on_delete()
+        recs = load_records(self.path)
+        self.assertEqual([r.name for r in recs], ['B'])
+        self.assertEqual(len(mgr.tree.get_children()), 1)
+
+    def test_delete_cancelled_keeps_record(self):
+        mgr = self._manager([LedgerRecord(name='A')])
+        mgr.tree.selection_set(mgr.tree.get_children()[0])
+        with mock.patch.object(messagebox, 'askyesno', return_value=False):
+            mgr._on_delete()
+        self.assertEqual(len(load_records(self.path)), 1)
+
+    def test_edit_dialog_skipped_keeps_record(self):
+        mgr = self._manager([LedgerRecord(name='A')])
+        mgr.tree.selection_set(mgr.tree.get_children()[0])
+        with mock.patch('polyglot_gui.LedgerRecordDialog',
+                        self._fake_dialog(None)), \
+                mock.patch.object(mgr, 'wait_window'):
+            mgr._on_edit()
+        self.assertEqual(load_records(self.path)[0].name, 'A')
 
 
 if __name__ == '__main__':

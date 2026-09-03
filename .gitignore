@@ -28,6 +28,14 @@ ffmpeg/
 # 日志文件 (CLI --log-file 产物)
 *.log
 
+# 资源台账 (含 RAR 密码, 属用户私人数据, 绝不入库)
+资源台账.json
+资源台账.html
+*台账*.json
+*台账*.html
+*台账*.bak
+ledger_config.json
+
 # 虚拟环境
 .venv/
 venv/

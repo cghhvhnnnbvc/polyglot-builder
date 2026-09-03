@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Polyglot Builder - 图形界面 v1.0
+Polyglot Builder - 图形界面 v1.1
 
 现代极简设计 (VS Code / Notion 风格):
   - 扁平化设计，去除所有立体边框
@@ -20,7 +20,7 @@ import sys
 import time
 import queue
 import struct
-from typing import Optional
+from typing import Dict, List, Optional
 
 try:
     from polyglot_build import (build_polyglot, verify_polyglot, format_size,
@@ -35,6 +35,13 @@ except ImportError:
                                 BuildCancelled, compress_video, find_ffmpeg,
                                 download_ffmpeg, FFMPEG_MIRRORS,
                                 VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY)
+
+from polyglot_ledger import (FIELD_LABELS, NETDISK_CHOICES, LedgerError,
+                             LedgerRecord, append_record, create_ledger,
+                             html_view_path, load_records, now_str,
+                             normalize_ledger_path, open_ledger,
+                             resolve_ledger_path, save_configured_path,
+                             save_records)
 
 
 # ============================================================
@@ -132,6 +139,12 @@ C_BAR_FILL    = '#34C759'   # 进度条绿色
 C_LOG_BG      = '#F0F0F2'   # 日志背景 (浅色系)
 C_LOG_FG      = '#3A3A3C'   # 日志默认文字
 
+# 次级功能按钮 (资源台账): 浅蓝底 + 蓝字, 与主行动蓝同色系但明显区分,
+# 在浅灰背景上对比清晰 (原本的中灰底白字对比不足, 不易识别)
+C_LEDGER       = '#E8F1FD'
+C_LEDGER_H     = '#D6E6FB'
+C_LEDGER_A     = '#C3DAF8'
+
 # ============================================================
 # 字体常量 (跨平台回退)
 # ============================================================
@@ -222,7 +235,9 @@ class RoundedButton(tk.Canvas):
 
     def _on_release(self, e):
         if self._enabled:
-            self._draw(C_PRIMARY_H)
+            # 用自身的悬停色而非硬编码主色, 否则自定义颜色的按钮 (如取消/台账)
+            # 点击后会闪一下蓝色
+            self._draw(self._hover_bg)
             if self._cmd:
                 self._cmd()
 
@@ -484,6 +499,296 @@ def _should_follow_outer(outer: str, has_value: bool, is_auto_filled: bool) -> b
 
 
 # ============================================================
+# 资源台账 - 记账对话框
+# ============================================================
+class LedgerRecordDialog(tk.Toplevel):
+    """台账记录编辑对话框 (新增与编辑共用)。
+
+    新增时: 文件名/大小/时间由调用方预填, 其余字段用户补充。
+    编辑时: 传入 record, 全部字段回填可改。
+    RAR 密码仅作记录: 加密由 WinRAR 负责, 本工具不参与加解密。
+    点"保存记录"后 self.record 为 LedgerRecord, 跳过/取消则为 None。
+    """
+
+    # (字段名, 标签, 右侧提示文字); netdisk 用下拉, 其余为输入框。
+    # 注: 不用 PlaceholderEntry —— 它会把占位文字写进绑定的 textvariable,
+    # 导致未填写的字段被存成提示文字; 这里改用常驻的右侧灰色提示。
+    _FIELDS = [
+        ('name', '资源名称', '这是什么资源, 如: 某游戏整合包'),
+        ('filename', '文件名', '构建后自动填入, 也可手改'),
+        ('size', '大小', '如: 1.5 GB'),
+        ('date', '记录时间', '留空则自动填当前时间'),
+        ('netdisk', '网盘', '下拉选择或直接输入'),
+        ('netdisk_path', '网盘位置', '如: /我的资源/2026/游戏'),
+        ('share_link', '分享链接', '可选'),
+        ('share_code', '提取码', '可选'),
+        ('rar_password', 'RAR 密码', 'WinRAR 解压密码 (仅本地明文记录)'),
+        ('note', '备注', '可选'),
+    ]
+
+    def __init__(self, parent, *, filename: str = '', size: str = '',
+                 date: str = '', record: Optional[LedgerRecord] = None):
+        super().__init__(parent)
+        editing = record is not None
+        if editing:
+            title = '编辑台账记录'
+        elif filename:
+            title = '记入资源台账'
+        else:
+            title = '新增台账记录'
+        self.title(title)
+        self.configure(bg=C_CARD, padx=18, pady=14)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.record: Optional[LedgerRecord] = None
+        self._vars: Dict[str, tk.StringVar] = {}
+
+        # 初始值: 编辑时全部回填; 新增时用构建产物预填 (手动新增则为空)
+        if record is not None:
+            initial = {k: str(getattr(record, k, '')) for k, _l, _h in self._FIELDS}
+        else:
+            initial = {'filename': filename, 'size': size, 'date': date}
+
+        for i, (key, label, hint) in enumerate(self._FIELDS):
+            ttk.Label(self, text=label, font=FONT_LABEL,
+                      foreground=C_TEXT).grid(row=i, column=0, sticky='w',
+                                              padx=(0, 10), pady=4)
+            var = tk.StringVar(value=initial.get(key, ''))
+            self._vars[key] = var
+            if key == 'netdisk':
+                widget: tk.Widget = ttk.Combobox(
+                    self, textvariable=var, values=NETDISK_CHOICES,
+                    font=FONT_ENTRY, width=32)
+            else:
+                widget = ttk.Entry(self, textvariable=var, font=FONT_ENTRY,
+                                   width=34)
+            widget.grid(row=i, column=1, sticky='w', pady=4)
+            ttk.Label(self, text=hint, font=FONT_HINT,
+                      foreground=C_TEXT_SEC).grid(row=i, column=2, sticky='w',
+                                                 padx=(10, 0), pady=4)
+
+        last = len(self._FIELDS)
+        ttk.Label(self, text='提示: 密码明文保存在本地台账文件中, 请勿上传网盘或发送给他人',
+                  font=FONT_HINT, foreground=C_TEXT_SEC).grid(
+                      row=last, column=0, columnspan=3, sticky='w', pady=(10, 8))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=last + 1, column=0, columnspan=3, sticky='e')
+        ttk.Button(btns, text='跳过', width=8,
+                   command=self._on_cancel).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text='保存记录', width=10,
+                   command=self._on_save).pack(side=tk.LEFT)
+
+        self.bind('<Return>', lambda e: self._on_save())
+        self.bind('<Escape>', lambda e: self._on_cancel())
+
+    def _on_save(self) -> None:
+        vals = {k: v.get().strip() for k, v in self._vars.items()}
+        if not vals.get('date'):
+            vals['date'] = now_str()   # 记录时间留空则自动填当前时间
+        self.record = LedgerRecord(**vals)
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.record = None
+        self.destroy()
+
+
+# ============================================================
+# 资源台账 - 管理窗口 (查看 / 新增 / 编辑 / 删除)
+# ============================================================
+class LedgerManagerDialog(tk.Toplevel):
+    """资源台账管理窗口。
+
+    为何不在网页里改: 浏览器打开的 file:// 页面没有写本地文件的权限
+    (File System Access API 在 file:// 下不可用, Firefox/Safari 也不支持),
+    因此台账的增删改统一在本窗口完成并即时写回 HTML;
+    网页版仅用于查看/搜索/密码遮罩/一键复制/导出 CSV。
+    """
+
+    # (字段, 列标题, 列宽)
+    COLUMNS = [('name', '资源名称', 190),
+               ('filename', '文件名', 150),
+               ('netdisk', '网盘', 90),
+               ('netdisk_path', '网盘位置', 180),
+               ('date', '记录时间', 110)]
+
+    def __init__(self, parent, path: str):
+        super().__init__(parent)
+        self.path = path
+        self.records: List[LedgerRecord] = []
+        self._iid_to_index: Dict[str, int] = {}
+
+        self.title('资源台账管理')
+        self.configure(bg=C_BG)
+        self.geometry('900x540')
+        self.minsize(760, 440)
+        self.transient(parent)
+
+        self._load()
+        self._build_ui()
+        self._refresh()
+
+    # --------------------------------------------------------
+    # 数据读写
+    # --------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            self.records = load_records(self.path)
+        except LedgerError as e:
+            self.records = []
+            messagebox.showerror('读取台账失败', str(e), parent=self)
+
+    def _save(self) -> bool:
+        """整体写回台账文件; 失败返回 False (不中断窗口使用)。"""
+        try:
+            save_records(self.path, self.records)
+        except LedgerError as e:
+            messagebox.showerror('保存台账失败', str(e), parent=self)
+            return False
+        self._refresh()
+        return True
+
+    # --------------------------------------------------------
+    # 界面
+    # --------------------------------------------------------
+    def _build_ui(self) -> None:
+        style = ttk.Style(self)
+        style.configure('Ledger.Treeview', rowheight=26, font=FONT_LABEL)
+        style.configure('Ledger.Treeview.Heading', font=FONT_SECTION)
+
+        top = ttk.Frame(self, padding=(14, 12, 14, 8))
+        top.pack(fill=tk.X)
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text='搜索', font=FONT_LABEL,
+                  foreground=C_TEXT_SEC).grid(row=0, column=0, sticky='w',
+                                              padx=(0, 8))
+        self._query = tk.StringVar()
+        self._query.trace_add('write', lambda *a: self._refresh())
+        # 不用 PlaceholderEntry: 它会把占位文字写进 textvariable, 干扰搜索
+        entry = ttk.Entry(top, textvariable=self._query, font=FONT_ENTRY, width=34)
+        entry.grid(row=0, column=1, sticky='w')
+        ttk.Label(top, text='按任意字段过滤 (名称/文件名/网盘/位置/密码/备注)',
+                  font=FONT_HINT, foreground=C_TEXT_SEC).grid(
+                      row=0, column=2, sticky='w', padx=(10, 0))
+
+        mid = ttk.Frame(self, padding=(14, 0, 14, 8))
+        mid.pack(fill=tk.BOTH, expand=True)
+        cols = [c[0] for c in self.COLUMNS]
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings',
+                                 style='Ledger.Treeview', selectmode='browse')
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor='w')
+        vsb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind('<Double-1>', lambda e: self._on_edit())
+
+        bottom = ttk.Frame(self, padding=(14, 0, 14, 10))
+        bottom.pack(fill=tk.X)
+        ttk.Button(bottom, text='新增记录',
+                   command=self._on_add).pack(side=tk.LEFT)
+        ttk.Button(bottom, text='编辑',
+                   command=self._on_edit).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bottom, text='删除',
+                   command=self._on_delete).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bottom, text='在浏览器中打开',
+                   command=self._on_open_browser).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bottom, text='关闭',
+                   command=self.destroy).pack(side=tk.RIGHT)
+        self._status_lbl = ttk.Label(bottom, text='', font=FONT_HINT,
+                                     foreground=C_TEXT_SEC)
+        self._status_lbl.pack(side=tk.RIGHT, padx=(0, 12))
+
+        ttk.Label(self, text=f'台账数据: {self.path}', font=FONT_HINT,
+                  foreground=C_TEXT_SEC).pack(anchor='w', padx=14, pady=(0, 2))
+        ttk.Label(self, text=f'查看页 (自动生成, 可删): {html_view_path(self.path)}',
+                  font=FONT_HINT, foreground=C_TEXT_SEC).pack(
+                      anchor='w', padx=14, pady=(0, 12))
+        self.bind('<Escape>', lambda e: self.destroy())
+
+    # --------------------------------------------------------
+    # 交互
+    # --------------------------------------------------------
+    def _refresh(self) -> None:
+        """按搜索词重建表格, 并维护 iid -> 记录索引 的映射。"""
+        q = self._query.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        self._iid_to_index = {}
+        for idx, rec in enumerate(self.records):
+            if q:
+                haystack = ' '.join(str(getattr(rec, k, ''))
+                                    for k, _lbl in FIELD_LABELS).lower()
+                if q not in haystack:
+                    continue
+            iid = self.tree.insert(
+                '', 'end',
+                values=[getattr(rec, k, '') or '—' for k, _l, _w in self.COLUMNS])
+            self._iid_to_index[iid] = idx
+        self._set_status()
+
+    def _set_status(self) -> None:
+        if not hasattr(self, '_status_lbl'):
+            return
+        shown = len(self.tree.get_children())
+        total = len(self.records)
+        suffix = '' if shown == total else f' (筛出 {shown} 条)'
+        self._status_lbl.configure(text=f'共 {total} 条{suffix}')
+
+    def _selected_index(self) -> Optional[int]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._iid_to_index.get(sel[0])
+
+    def _on_add(self) -> None:
+        dlg = LedgerRecordDialog(self, date=now_str())
+        dlg.grab_set()
+        self.wait_window(dlg)
+        if dlg.record is None:
+            return
+        self.records.append(dlg.record)
+        self._save()
+
+    def _on_edit(self) -> None:
+        idx = self._selected_index()
+        if idx is None:
+            messagebox.showinfo('提示', '请先在列表中选择一条记录', parent=self)
+            return
+        dlg = LedgerRecordDialog(self, record=self.records[idx])
+        dlg.grab_set()
+        self.wait_window(dlg)
+        if dlg.record is None:
+            return
+        self.records[idx] = dlg.record
+        self._save()
+
+    def _on_delete(self) -> None:
+        idx = self._selected_index()
+        if idx is None:
+            messagebox.showinfo('提示', '请先在列表中选择一条记录', parent=self)
+            return
+        rec = self.records[idx]
+        label = rec.name or rec.filename or '(未命名记录)'
+        if not messagebox.askyesno(
+                '确认删除',
+                f'确定删除这条台账记录吗？\n\n{label}\n\n'
+                '(仅删除台账记录, 不会影响已构建的文件)', parent=self):
+            return
+        del self.records[idx]
+        self._save()
+
+    def _on_open_browser(self) -> None:
+        try:
+            open_ledger(self.path)
+        except Exception as e:  # webbrowser 在部分环境可能报错
+            messagebox.showerror('打开失败', f'无法打开台账文件:\n{e}', parent=self)
+
+
+# ============================================================
 # 主界面
 # ============================================================
 class PolyglotGUI:
@@ -739,10 +1044,24 @@ class PolyglotGUI:
         # 行 6: 底部提示
         main.rowconfigure(5, weight=1)
 
-        # === 标题 ===
-        title = ttk.Label(main, text='Polyglot Builder',
+        # === 标题行 (左: 标题, 右: 资源台账入口) ===
+        # 台账是独立功能入口, 不属于构建动作, 故不放在构建按钮行;
+        # 放标题行右侧可避开该行与文件卡片内按钮的边距不一致问题。
+        header = ttk.Frame(main)
+        header.grid(row=0, column=0, sticky='ew', pady=(0, 16))
+        header.columnconfigure(0, weight=1)
+
+        title = ttk.Label(header, text='Polyglot Builder',
                           font=FONT_TITLE, foreground=C_TEXT)
-        title.grid(row=0, column=0, sticky='w', pady=(0, 16))
+        title.grid(row=0, column=0, sticky='w')
+
+        self.ledger_btn = RoundedButton(
+            header, text='资源台账', command=self._open_ledger,
+            bg=C_LEDGER, fg=C_PRIMARY, hover_bg=C_LEDGER_H,
+            active_bg=C_LEDGER_A, canvas_bg=C_BG,
+            font=FONT_ENTRY, width=124, height=34, radius=6
+        )
+        self.ledger_btn.grid(row=0, column=1, sticky='e')
 
         # === 文件选择卡片 ===
         card_frame = tk.Frame(main, bg=C_CARD, bd=1, relief='solid',
@@ -1061,10 +1380,22 @@ class PolyglotGUI:
     # --------------------------------------------------------
     # 构建
     # --------------------------------------------------------
+    @staticmethod
+    def _entry_value(var, entry) -> str:
+        """输入框的实际值: 仍在显示占位提示时视为空。
+
+        PlaceholderEntry 初始化时会把占位文字 insert 进输入框, 绑定的
+        textvariable 因此也含有提示文字; 直接用 var.get() 会把提示当成用户输入
+        (导致"外层文件不存在: 选择视频/图片/文档"这类莫名错误)。
+        """
+        if entry is not None and not entry.has_value:
+            return ''
+        return var.get().strip()
+
     def _start_build(self):
-        outer = self._outer_path.get().strip()
-        rar   = self._rar_path.get().strip()
-        out   = self._output_path.get().strip()
+        outer = self._entry_value(self._outer_path, self._outer_entry)
+        rar   = self._entry_value(self._rar_path, self._rar_entry)
+        out   = self._entry_value(self._output_path, self._out_entry)
 
         if not outer:
             messagebox.showwarning('提示', '请选择外层文件'); return
@@ -1190,6 +1521,67 @@ class PolyglotGUI:
             f'  2. 改后缀 .zip -> WinRAR 解压\n'
             f'  3. 输入 RAR 密码 -> 得到最终内容'
         )
+
+        # 构建成功 -> 询问是否记入资源台账 (文件名/大小/时间自动预填)
+        if messagebox.askyesno(
+                '记入资源台账',
+                '要把这次构建记入资源台账吗？\n\n'
+                '台账记录资源名称、网盘位置与 RAR 密码,\n'
+                '资源多了也不会记混。\n\n'
+                '(密码仅明文保存在本地台账文件中, 不会随资源上传)'):
+            self._prompt_ledger_record(out, size_str)
+
+    # --------------------------------------------------------
+    # 资源台账
+    # --------------------------------------------------------
+    def _open_ledger(self) -> None:
+        """打开资源台账管理窗口 (可增删改); 台账不存在时先引导创建。"""
+        path = normalize_ledger_path(resolve_ledger_path())
+        if not os.path.isfile(path):
+            if not messagebox.askyesno(
+                    '创建资源台账',
+                    '还没有资源台账文件。\n\n'
+                    '台账记录每个资源的名称、网盘位置与 RAR 密码,\n'
+                    '可在管理窗口中增删改, 也可用浏览器打开查看\n'
+                    '(支持搜索 / 密码遮罩 / 导出 CSV)。\n\n'
+                    '接下来请选择台账数据文件 (.json) 的保存位置;\n'
+                    '同名的 .html 查看页会自动生成在旁边。\n\n'
+                    '是否现在创建？'):
+                return
+            chosen = filedialog.asksaveasfilename(
+                title='选择台账数据文件保存位置', defaultextension='.json',
+                initialfile=os.path.basename(path),
+                initialdir=os.path.dirname(path),
+                filetypes=[('资源台账数据 (*.json)', '*.json')])
+            if not chosen:
+                return
+            path = normalize_ledger_path(chosen)
+            try:
+                create_ledger(path)
+            except LedgerError as e:
+                messagebox.showerror('创建失败', str(e))
+                return
+            save_configured_path(path)
+            self._log_async(f'已创建资源台账: {path}', 'success')
+        LedgerManagerDialog(self.root, path)
+
+    def _prompt_ledger_record(self, out: str, size_str: str) -> None:
+        """弹出记账对话框并写入台账 (台账不存在时自动在默认位置创建)。"""
+        dlg = LedgerRecordDialog(self.root, filename=os.path.basename(out),
+                                 size=size_str, date=now_str())
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        if dlg.record is None:
+            return
+        path = normalize_ledger_path(resolve_ledger_path())
+        try:
+            append_record(path, dlg.record)
+        except LedgerError as e:
+            messagebox.showerror('记账失败', str(e))
+            return
+        save_configured_path(path)
+        label = dlg.record.name or dlg.record.filename
+        self._log_async(f'已记入资源台账: {label}', 'success')
 
     def _on_error(self, msg):
         self.build_btn.configure(state=tk.NORMAL)

@@ -3,7 +3,7 @@
 # `from __future__ import annotations` 保持对旧 Python 的运行兼容,
 # 但类型检查以较新版本语法为准。
 python_version = "3.10"
-files = ["polyglot_build.py", "polyglot_gui.py"]
+files = ["polyglot_build.py", "polyglot_gui.py", "polyglot_ledger.py"]
 strict = false
 warn_unused_ignores = true
 check_untyped_defs = true

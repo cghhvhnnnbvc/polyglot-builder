@@ -48,7 +48,7 @@ ProgressCallback = Callable[[str, int, int, str], None]
 # ============================================================
 # 版本号 (单一来源: GUI / CLI / bat 均需与此保持一致)
 # ============================================================
-VERSION = '1.0'
+VERSION = '1.1'
 
 
 # ============================================================
@@ -1191,6 +1191,53 @@ def _run_batch(args: argparse.Namespace, logger: logging.Logger) -> None:
     sys.exit(0)
 
 
+def _record_to_ledger(args, output_path: str, logger) -> None:
+    """构建成功后把本次产物记入资源台账 (仅 CLI --ledger 时调用)。
+
+    密码只在交互式终端下用 getpass 询问 (不回显、不进 shell 历史);
+    非 TTY / 静默模式时密码留空, 可事后在台账 HTML 中补录。
+    记账失败不影响构建结果, 仅警告。
+    """
+    from polyglot_ledger import (LedgerError, LedgerRecord, append_record,
+                                 normalize_ledger_path, now_str,
+                                 save_configured_path)
+
+    # 台账以 JSON 为数据源: 传入旧版 .html 路径也会规范化并自动迁移
+    ledger_path = normalize_ledger_path(args.ledger)
+
+    password = ''
+    if sys.stdin.isatty() and not args.quiet:
+        import getpass
+        try:
+            password = getpass.getpass(
+                'RAR 密码 (记入台账, 输入不回显; 直接回车跳过): ')
+        except (EOFError, KeyboardInterrupt):
+            password = ''
+
+    try:
+        size_str = format_size(os.path.getsize(output_path))
+    except OSError:
+        size_str = '未知'
+
+    record = LedgerRecord(
+        name=args.ledger_name or os.path.basename(output_path),
+        filename=os.path.basename(output_path),
+        size=size_str,
+        date=now_str(),
+        netdisk=args.ledger_netdisk or '',
+        netdisk_path=args.ledger_location or '',
+        rar_password=password,
+        note=args.note or '',
+    )
+    try:
+        append_record(ledger_path, record)
+    except LedgerError as e:
+        logger.warning('记入资源台账失败: %s', e)
+        return
+    save_configured_path(ledger_path)
+    logger.info('已记入资源台账: %s (%s)', ledger_path, record.name)
+
+
 def main() -> None:
     """主函数 - 解析命令行参数并执行构建"""
     parser = argparse.ArgumentParser(
@@ -1271,6 +1318,37 @@ def main() -> None:
         '--log-file',
         metavar='PATH',
         help='将日志额外持久化到指定文件 (追加模式, UTF-8), 便于事后排查'
+    )
+
+    parser.add_argument(
+        '--ledger',
+        metavar='PATH',
+        help='资源台账数据文件 (推荐 .json): 构建成功后追加一条记录, 不存在则自动创建; '
+             '同名的 .html 查看页会自动生成 (传旧版 .html 路径也会自动迁移)'
+    )
+
+    parser.add_argument(
+        '--ledger-name',
+        metavar='TEXT',
+        help='台账记录的资源名称 (缺省用输出文件名)'
+    )
+
+    parser.add_argument(
+        '--ledger-netdisk',
+        metavar='TEXT',
+        help='台账记录的网盘平台, 如 "百度网盘"'
+    )
+
+    parser.add_argument(
+        '--ledger-location',
+        metavar='TEXT',
+        help='台账记录的网盘位置/目录, 如 "/我的资源/2026"'
+    )
+
+    parser.add_argument(
+        '--note',
+        metavar='TEXT',
+        help='台账记录的备注'
     )
 
     parser.add_argument(
@@ -1398,6 +1476,10 @@ def main() -> None:
                 os.remove(compressed_outer)
             except OSError:
                 pass
+
+        # 资源台账: 仅在 --ledger 指定时记账 (密码交互输入, 不回显)
+        if args.ledger:
+            _record_to_ledger(args, output_path, logger)
 
     except KeyboardInterrupt:
         if compressed_outer and os.path.exists(compressed_outer):

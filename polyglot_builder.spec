@@ -14,7 +14,8 @@
   - ffmpeg/ 若存在于源码目录会被一并打包为内置资源 (免运行时下载);
     不存在则程序仍可通过 find_ffmpeg()/download_ffmpeg() 按需下载。
   - 入口为 polyglot_build.py (含 CLI main 与 --gui 分发);
-    polyglot_gui 为惰性导入, 用 hiddenimports 显式纳入。
+    polyglot_gui (惰性导入) 与 polyglot_ledger (资源台账, CLI 内惰性导入)
+    用 hiddenimports 显式纳入。
   - console=False (GUI 子系统): 双击 exe 直接弹 GUI, 彻底消除黑色控制台一闪;
     代价是 exe 的 CLI 模式无控制台输出 (改用 --log-file 看日志, 或用源码跑 CLI)。
 """
@@ -34,7 +35,7 @@ a = Analysis(
     pathex=[SRC_DIR],
     binaries=[],
     datas=datas,
-    hiddenimports=['polyglot_gui'],
+    hiddenimports=['polyglot_gui', 'polyglot_ledger'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

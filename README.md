@@ -1,6 +1,6 @@
 # Polyglot Builder - 多格式文件拼接工具
 
-![CI](https://github.com/cghhvhnnnbvc/polyglot-builder/actions/workflows/ci.yml/badge.svg) ![版本](https://img.shields.io/badge/version-1.0-blue)
+![CI](https://github.com/cghhvhnnnbvc/polyglot-builder/actions/workflows/ci.yml/badge.svg) ![版本](https://img.shields.io/badge/version-1.1-blue)
 
 把媒体/文档文件与 AES-256 加密 RAR 拼接为一个"多格式文件"：**既能正常播放/打开，改后缀为 `.zip` 又能解压出加密 RAR**。
 
@@ -34,6 +34,19 @@
 - 上传网盘：文件看起来就是一段正常视频/一张图
 - 下载方：把后缀改为 `.zip` → 解压出加密 RAR → 输入密码拿到内容
 
+## 资源台账
+
+资源多了记不住“哪个文件是什么、放哪了、密码多少”？**构建成功后可选“记入资源台账”**：
+
+- 台账数据存为本地 **`资源台账.json`**（唯一数据源），并自动生成同名的 **`.html` 查看页**（衍生物，删了会重建）
+- 记录资源名称、网盘平台与位置、分享链接、提取码、RAR 密码、备注；文件名/大小/时间**自动预填**
+- 主界面右上角的 **「资源台账」按钮** 打开管理窗口：**新增 / 编辑 / 删除 / 搜索**，改动即时写回文件
+- 也可用浏览器打开查看：**搜索、按网盘筛选、密码遮罩（点“显示”才可见）、一键复制、导出 CSV**
+- 命令行用 `--ledger` 也能记账
+
+> ⚠️ 台账中的密码为**明文存储**，`.json` 与 `.html` 两个文件请只留在本地，切勿上传网盘或发给他人。
+> 详见 [资源台账文档](docs/ledger.md)。
+
 ## 外层文件格式兼容性
 
 | 格式 | 兼容性 | 说明 |
@@ -66,6 +79,7 @@ A: 不用。图形界面覆盖日常全部场景; 命令行仅供批量/脚本�
 ## 更多文档
 
 - [CLI 参数详解](docs/cli.md) — 命令行完整参数、批量模式
+- [资源台账](docs/ledger.md) — 资源目录与密码记录
 - [技术原理](docs/technical.md) — 文件结构、为什么能"一文件两用"
 - [开发与打包指南](docs/development.md) — 测试、本地打包、CI 与自动发版
 - [更新记录](CHANGELOG.md)

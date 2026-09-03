@@ -15,17 +15,19 @@
 | `polyglot_build.bat` | 启动器 (双模式：有参数走命令行，无参数走 GUI) |
 | `polyglot_build.py` | 核心构建脚本 (GUI / CLI 共用核心逻辑) |
 | `polyglot_gui.py` | 图形界面 (tkinter, Python 标准库) |
-| `test_polyglot.py` | 回归测试 (unittest, 零依赖, 71 用例) |
+| `polyglot_ledger.py` | 资源台账模块 (JSON 数据源 + HTML 查看页生成 + 旧版迁移) |
+| `test_polyglot.py` | 回归测试 (unittest, 零依赖, 120 用例) |
 | `polyglot_builder.spec` | PyInstaller 打包配置 (onedir, 可选) |
 | `build_dist.bat` | 一键打包脚本 (装 PyInstaller → 跑测试 → 打包, 可选) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (mypy + unittest 多平台矩阵) |
 | `.github/workflows/release.yml` | 自动发版 (推送 v* 标签即自动打包并发布到 Releases) |
-| `docs/` | CLI 参数、技术原理等详细文档 |
+| `docs/` | CLI 参数、资源台账、技术原理等详细文档 |
+| `CHANGELOG.md` | 版本更新记录 |
 
 ## 运行测试与类型检查
 
 ```bash
-python -m unittest test_polyglot          # 71 用例, 零依赖
+python -m unittest test_polyglot          # 120 用例, 零依赖
 python -m mypy                            # Windows 视角
 python -m mypy --platform linux           # 模拟 CI ubuntu 视角
 ```
@@ -61,3 +63,20 @@ pyinstaller --noconfirm polyglot_builder.spec
   流程: 校验标签与 `VERSION` 常量一致 → 跑测试 → PyInstaller 打包 → 压缩 zip → 创建 GitHub Release (自带中文说明)。
 
 - **版本号单一来源**: `polyglot_build.py` 的 `VERSION` 常量; `polyglot_build.bat` 与 `README` 徽章需同步, `test_version_format` 等用例守护 bat 与常量一致。
+
+## 资源台账模块约定
+
+- **JSON 是唯一数据源** (`资源台账.json`, 结构 `{"version": 1, "records": [...]}`);
+  写入必须原子 (临时文件 + `os.replace`), 避免写一半损坏
+- **HTML 查看页是衍生物** (同 stem 的 `.html`): 每次 `save_records` 由 JSON 重新生成,
+  可随时删除重建; 数据内嵌而非外链 (浏览器拦截 `file://` 页面 fetch 同目录文件)
+- 所有公开函数接受 `.json` 或旧版 `.html` 路径, 内部统一经 `normalize_ledger_path()` 规范化;
+  `migrate_legacy_html()` 负责旧版单文件台账迁移 (旧 HTML 改名 `.bak` 保留)
+- 生成查看页时必须把 JSON 中的 `</` 转义为 `<\/`, 否则值里的 `</script>` 会提前闭合数据块
+  (`test_script_close_tag_escaped_in_view_only` 守护: 查看页转义、JSON 数据源保持原样)
+- 查看器渲染一律用 `textContent` 而非 `innerHTML`, 避免用户输入造成 HTML 注入
+- 读写失败统一抛 `LedgerError`; 记账失败**不得**影响构建结果 (CLI 仅警告)
+- **增删改只在 GUI 管理窗口 (`LedgerManagerDialog`) 做**: 浏览器 `file://` 页面无写本地文件权限
+  (File System Access API 不可用, Firefox/Safari 不支持), 网页版定位为只读查看器
+- 台账文件 (`.json`/`.html`/`.bak`) 与 `ledger_config.json` 已在 `.gitignore` 中排除 (含密码, 绝不入库);
+  新增测试时勿向仓库目录写台账配置 (参考 `TestLedgerCLI.setUp` 的 mock)

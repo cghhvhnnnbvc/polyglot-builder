@@ -23,6 +23,11 @@ python polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 | `--compress [QUALITY]` | 压缩外层视频以减小体积、提高隐蔽性 (需 ffmpeg); QUALITY: `high`/`medium`/`low`, 默认 `medium` |
 | `--batch MANIFEST` | 批量模式: 指定清单文本文件 (见下文) |
 | `--log-file PATH` | 将日志额外持久化到指定文件 (追加模式, UTF-8), 便于事后排查 |
+| `--ledger PATH` | 资源台账文件 (HTML): 构建成功后追加一条记录, 文件不存在则自动创建 |
+| `--ledger-name TEXT` | 台账记录的资源名称 (缺省用输出文件名) |
+| `--ledger-netdisk TEXT` | 台账记录的网盘平台, 如 `百度网盘` |
+| `--ledger-location TEXT` | 台账记录的网盘位置/目录, 如 `/我的资源/2026` |
+| `--note TEXT` | 台账记录的备注 |
 | `--version` | 显示版本号 |
 
 > Ctrl+C 可随时中止 CLI 构建, 半成品输出会被自动清理 (退出码 130)。
@@ -49,6 +54,23 @@ python polyglot_build.py --gui
 D:\media\v1.mp4|D:\rar\s1.rar|D:\out\v1.mp4
 D:\media\v2.mp4|D:\rar\s2.rar
 ```
+
+## 资源台账 (--ledger)
+
+```bash
+python polyglot_build.py video.mp4 game.rar -o out.mp4 ^
+  --ledger 资源台账.html ^
+  --ledger-name "某游戏整合包" ^
+  --ledger-netdisk "百度网盘" ^
+  --ledger-location "/我的资源/2026/游戏" ^
+  --note "第一次上传"
+```
+
+- 不加 `--ledger` 时 CLI 完全不产生台账文件 (无副作用)
+- **RAR 密码**: 交互式终端下用 `getpass` 询问 (输入不回显、不进 shell 历史);
+  `-q` 静默模式或非交互环境 (CI/脚本) 下密码留空, 可事后在台账网页里补
+- 记账失败不影响构建结果, 仅在日志中警告
+- 台账详情见 [资源台账](ledger.md)
 
 ## 打包版 exe 的 CLI 注意事项
 
