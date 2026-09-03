@@ -48,12 +48,28 @@ jobs:
       - name: 压缩产物
         run: Compress-Archive -Path dist/PolyglotBuilder -DestinationPath "PolyglotBuilder-${{ github.ref_name }}-windows-x64.zip"
 
+      # Release 正文模板: 每次发版前只需把"本版本新增"改成该版本的亮点,
+      # 其余部分 (下载说明 / 快速上手) 保持不变; Full Changelog 由 action 自动追加。
       - name: 创建 Release 并上传
         uses: softprops/action-gh-release@v2
         with:
           files: PolyglotBuilder-${{ github.ref_name }}-windows-x64.zip
           generate_release_notes: true
+          # 标题默认等于标签名; 需要副标题时在此改写 (如 "v1.1 — 资源台账")
+          name: ${{ github.ref_name }} — 资源台账
           body: |
+            ## 📒 本版本新增 (v1.1)
+
+            - **资源台账**: 记录每个资源的名称、网盘平台与位置、分享链接、提取码、RAR 密码、备注——资源多了也不会记混
+            - 数据存为本地 `资源台账.json` (唯一数据源), 并自动生成同名 `.html` 查看页: 双击浏览器即开, 支持搜索 / 按网盘筛选 / 密码遮罩 / 一键复制 / 导出 CSV
+            - 主界面右上角「资源台账」按钮打开管理窗口, 可**新增 / 编辑 / 删除**; 构建成功后会询问是否记账, 文件名/大小/时间自动预填
+            - 命令行新增 `--ledger` 系列参数, 脚本/批量场景也能记账
+            - 修复: 记账对话框全字段可编辑; 未填写字段不再被写入输入框提示文字; 自定义颜色按钮点击后不再闪蓝
+
+            > ⚠️ 台账中的 RAR 密码为**明文存储**, 台账文件请只留在本地, 切勿上传网盘或发给他人。
+
+            ---
+
             ## 📦 下载与使用
 
             - **Windows 用户**：下载下方 `PolyglotBuilder-*.zip`，解压后**双击 `PolyglotBuilder.exe`** 即可使用，**无需安装 Python**
@@ -66,5 +82,6 @@ jobs:
             2. 打开 PolyglotBuilder，选择一个正常的视频/图片/文档作为**外层文件**
             3. 选择加密的 **RAR 文件**，点"开始构建"
             4. 生成的文件可正常播放/打开；将其后缀改为 `.zip` 后，又能解压出加密的 RAR
+            5. （可选）构建成功后选择"记入资源台账"，记下网盘位置与密码
 
-            详细说明见 [README](https://github.com/cghhvhnnnbvc/polyglot-builder#readme)。
+            详细说明见 [README](https://github.com/cghhvhnnnbvc/polyglot-builder#readme) 与 [资源台账文档](https://github.com/cghhvhnnnbvc/polyglot-builder/blob/main/docs/ledger.md)。
