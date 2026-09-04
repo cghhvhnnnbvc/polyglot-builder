@@ -1046,6 +1046,60 @@ class TestGuiHwEncoderToggle(unittest.TestCase):
             f'大字体下硬件编码勾选被裁在窗口外 (右缘 {right} > 窗口 {win_right})')
 
 
+class TestGuiLedgerRestore(unittest.TestCase):
+    """守护台账恢复路径: 选到已存在的台账 .json 时绝不可清空覆盖。"""
+
+    def _build_gui(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        return root, gui
+
+    def test_open_ledger_never_overwrites_existing_file(self):
+        from unittest import mock
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        tmpdir = tempfile.mkdtemp(prefix='ledger_restore_')
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        existing = os.path.join(tmpdir, '资源台账.json')
+        polyglot_ledger.append_record(
+            existing, polyglot_ledger.LedgerRecord(name='备份里的记录'))
+        with mock.patch('polyglot_gui.resolve_ledger_path',
+                        return_value=os.path.join(tmpdir, 'missing.json')), \
+                mock.patch.object(messagebox, 'askyesno', return_value=True), \
+                mock.patch.object(polyglot_gui.filedialog, 'asksaveasfilename',
+                                  return_value=existing), \
+                mock.patch('polyglot_gui.save_configured_path'), \
+                mock.patch('polyglot_gui.LedgerManagerDialog'):
+            gui._open_ledger()
+        recs = polyglot_ledger.load_records(existing)
+        self.assertEqual([r.name for r in recs], ['备份里的记录'],
+                         '选到已存在的台账时必须直接使用, 绝不可清空覆盖')
+
+    def test_open_ledger_creates_when_path_is_new(self):
+        from unittest import mock
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        tmpdir = tempfile.mkdtemp(prefix='ledger_new_')
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        target = os.path.join(tmpdir, '新台账.json')
+        with mock.patch('polyglot_gui.resolve_ledger_path',
+                        return_value=os.path.join(tmpdir, 'missing.json')), \
+                mock.patch.object(messagebox, 'askyesno', return_value=True), \
+                mock.patch.object(polyglot_gui.filedialog, 'asksaveasfilename',
+                                  return_value=target), \
+                mock.patch('polyglot_gui.save_configured_path'), \
+                mock.patch('polyglot_gui.LedgerManagerDialog'):
+            gui._open_ledger()
+        self.assertTrue(os.path.isfile(target), '新位置应创建空台账')
+        self.assertEqual(polyglot_ledger.load_records(target), [])
+
+
 class TestGuiPollingCleanup(unittest.TestCase):
     """守护关窗/销毁时取消日志轮询 (避免 Tk 报 invalid command name)。"""
 

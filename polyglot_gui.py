@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Polyglot Builder - 图形界面 v1.2.1
+Polyglot Builder - 图形界面 v1.2.2
 
 现代极简设计 (VS Code / Notion 风格):
   - 扁平化设计，去除所有立体边框
@@ -1605,34 +1605,39 @@ class PolyglotGUI:
     # 资源台账
     # --------------------------------------------------------
     def _open_ledger(self) -> None:
-        """打开资源台账管理窗口 (可增删改); 台账不存在时先引导创建。"""
+        """打开资源台账管理窗口 (可增删改); 台账不存在时引导创建或选择已有文件。"""
         path = normalize_ledger_path(resolve_ledger_path())
         if not os.path.isfile(path):
             if not messagebox.askyesno(
-                    '创建资源台账',
-                    '还没有资源台账文件。\n\n'
+                    '创建或选择资源台账',
+                    '还没有正在使用的资源台账文件。\n\n'
                     '台账记录每个资源的名称、网盘位置与 RAR 密码,\n'
                     '可在管理窗口中增删改, 也可用浏览器打开查看\n'
                     '(支持搜索 / 密码遮罩 / 导出 CSV)。\n\n'
-                    '接下来请选择台账数据文件 (.json) 的保存位置;\n'
-                    '同名的 .html 查看页会自动生成在旁边。\n\n'
-                    '是否现在创建？'):
+                    '接下来可以选择:\n'
+                    '· 一个新位置 -> 创建空台账;\n'
+                    '· 一个已有的台账 .json (如备份恢复回来的) -> 直接用它。\n\n'
+                    '是否继续？'):
                 return
             chosen = filedialog.asksaveasfilename(
-                title='选择台账数据文件保存位置', defaultextension='.json',
+                title='创建新台账或选择已有台账 (.json)', defaultextension='.json',
                 initialfile=os.path.basename(path),
                 initialdir=os.path.dirname(path),
                 filetypes=[('资源台账数据 (*.json)', '*.json')])
             if not chosen:
                 return
             path = normalize_ledger_path(chosen)
-            try:
-                create_ledger(path)
-            except LedgerError as e:
-                messagebox.showerror('创建失败', str(e))
-                return
+            if os.path.isfile(path):
+                # 选到已存在的台账 (如恢复的备份): 直接使用, 绝不清空覆盖
+                self._log_async(f'使用已有资源台账: {path}', 'info')
+            else:
+                try:
+                    create_ledger(path)
+                except LedgerError as e:
+                    messagebox.showerror('创建失败', str(e))
+                    return
+                self._log_async(f'已创建资源台账: {path}', 'success')
             save_configured_path(path)
-            self._log_async(f'已创建资源台账: {path}', 'success')
         LedgerManagerDialog(self.root, path)
 
     def _prompt_ledger_record(self, out: str, size_str: str) -> None:
