@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul 2>&1
 @rem 版本号须与 polyglot_build.py 的 VERSION 常量保持一致
-title Polyglot Builder v1.2
+title Polyglot Builder v1.2.1
 set "SCRIPT_DIR=%~dp0"
 
 where python >nul 2>&1
@@ -18,7 +18,7 @@ if not "%~1"=="" goto :cli
 
 echo.
 echo ========================================
-echo   Polyglot Builder v1.2
+echo   Polyglot Builder v1.2.1
 echo ========================================
 echo.
 echo   [1] GUI (default)
@@ -32,7 +32,7 @@ exit /b %errorlevel%
 :cli
 echo.
 echo ========================================
-echo   Polyglot Builder v1.2
+echo   Polyglot Builder v1.2.1
 echo ========================================
 echo.
 if "%~2"=="" (

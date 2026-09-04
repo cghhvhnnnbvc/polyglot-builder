@@ -930,6 +930,121 @@ class TestGuiHwEncoderToggle(unittest.TestCase):
         cv.assert_called_once()
         self.assertIs(cv.call_args[1].get('use_hw'), False)
 
+    def test_compression_controls_grouped_in_one_row(self):
+        """压缩表面视频的开关/档位/硬件编码必须同排, 且与 Deflate 分行。
+
+        v1.2.1 的 2x2 布局把档位+硬件编码与开关拆到两行, 读起来像
+        另一组独立功能; 现改为整组同排 + 左缩进表达从属。
+        """
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        row2 = gui._quality_combo.master
+        self.assertIs(gui._hw_cb.master, row2,
+                      '硬件编码应与档位下拉同排')
+        kids = row2.winfo_children()
+        compress_in_row2 = any(
+            c.winfo_class() == 'Checkbutton'
+            and str(c.cget('variable')) == str(gui._compress_var)
+            for c in kids)
+        self.assertTrue(compress_in_row2,
+                        '压缩表面视频开关应与档位/硬件编码同排')
+        # Deflate 在另一行 (它是内层 RAR 压缩, 与表面视频压缩是两回事)
+        row1 = gui._quality_combo.master.master.winfo_children()[0]
+        self.assertIsNot(row1, row2, 'Deflate 与压缩表面视频应分行')
+        deflate_in_row1 = any(
+            c.winfo_class() == 'Checkbutton'
+            and str(c.cget('variable')) == str(gui._deflate_var)
+            for c in row1.winfo_children())
+        self.assertTrue(deflate_in_row1, 'Deflate 应单独一行')
+
+    def test_selected_quality_reverse_mapping(self):
+        """档位下拉显示短文案, key 靠反向映射解析 (不再用前缀匹配)。"""
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        gui._compress_var.set(True)
+        for key in ('high', 'medium', 'low'):
+            gui._quality_combo.set(polyglot_build.VIDEO_QUALITY[key][2])
+            self.assertEqual(gui._selected_quality(), key)
+        # 未勾选压缩时返回 None (不压缩)
+        gui._compress_var.set(False)
+        self.assertIsNone(gui._selected_quality())
+
+    def test_quality_combo_default_shows_medium_label(self):
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        self.assertEqual(
+            gui._quality_combo.get(),
+            polyglot_build.VIDEO_QUALITY[polyglot_build.DEFAULT_VIDEO_QUALITY][2])
+
+    def test_run_skips_compression_when_compress_unchecked(self):
+        """复选框才是压缩开关: 未勾选时不应调用 compress_video。"""
+        from unittest import mock
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        tmpdir = tempfile.mkdtemp(prefix='gui_nocomp_')
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        outer = os.path.join(tmpdir, 'movie.mp4')
+        rar = os.path.join(tmpdir, 'data.rar')
+        out = os.path.join(tmpdir, 'output.bin')
+        gui._compress_var.set(False)
+        with mock.patch('polyglot_gui.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_gui.compress_video') as cv, \
+                mock.patch('polyglot_gui.build_polyglot') as bp, \
+                mock.patch('polyglot_gui.verify_polyglot'), \
+                mock.patch.object(root, 'after', lambda *a, **k: None):
+            gui._run(outer, rar, out)
+        cv.assert_not_called()
+        bp.assert_called_once()
+        self.assertEqual(bp.call_args[0][0], outer,
+                         '未勾选压缩时外层应原样使用, 不应走压缩产物')
+
+    def test_option_rows_fit_at_large_font(self):
+        """模拟 150% 缩放: 选项区每一行都不应超宽 (防裁切回归)。"""
+        import tkinter as tk
+        saved = polyglot_gui.FONT_ENTRY
+        polyglot_gui.FONT_ENTRY = (saved[0], 15)
+        self.addCleanup(setattr, polyglot_gui, 'FONT_ENTRY', saved)
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境: {e}')
+        self.addCleanup(root.destroy)
+        root.geometry('880x700')
+        with mock.patch.object(polyglot_gui, '_resolve_fonts', lambda r: None):
+            gui = PolyglotGUI(root)
+        root.update_idletasks()
+        root.update()
+        opt = gui._quality_combo.master.master
+        for i, row in enumerate(opt.winfo_children(), 1):
+            req = sum(c.winfo_reqwidth() for c in row.winfo_children())
+            avail = row.winfo_width()
+            self.assertLessEqual(
+                req, avail,
+                f'150% 缩放下选项区第 {i} 行超宽 ({req} > {avail}), 会裁切控件')
+
+    def test_hw_checkbox_visible_when_first_row_overflows(self):
+        """模拟大字体环境: 第一行被撑宽时, 硬件编码仍应完整可见。"""
+        import tkinter as tk
+        saved = polyglot_gui.FONT_ENTRY
+        polyglot_gui.FONT_ENTRY = (saved[0], 20)   # 放大下拉等控件, 模拟高 DPI
+        self.addCleanup(setattr, polyglot_gui, 'FONT_ENTRY', saved)
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境: {e}')
+        self.addCleanup(root.destroy)
+        root.geometry('880x700')
+        # 跳过字体自适应, 让放大后的 FONT_ENTRY 生效
+        with mock.patch.object(polyglot_gui, '_resolve_fonts', lambda r: None):
+            gui = PolyglotGUI(root)
+        root.update_idletasks()
+        root.update()
+        win_right = root.winfo_rootx() + root.winfo_width()
+        right = gui._hw_cb.winfo_rootx() + gui._hw_cb.winfo_width()
+        self.assertLessEqual(
+            right, win_right,
+            f'大字体下硬件编码勾选被裁在窗口外 (右缘 {right} > 窗口 {win_right})')
+
 
 class TestGuiPollingCleanup(unittest.TestCase):
     """守护关窗/销毁时取消日志轮询 (避免 Tk 报 invalid command name)。"""
@@ -1048,7 +1163,8 @@ class TestVersionConsistency(unittest.TestCase):
 
     def test_version_format(self):
         import re
-        self.assertRegex(polyglot_build.VERSION, r'^\d+\.\d+$')
+        # 允许两段 (1.2) 或三段 (1.2.1) 语义化版本
+        self.assertRegex(polyglot_build.VERSION, r'^\d+\.\d+(\.\d+)?$')
 
     def test_bat_versions_match_constant(self):
         import re
@@ -1061,7 +1177,7 @@ class TestVersionConsistency(unittest.TestCase):
                 continue
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
-            for m in re.findall(r'v(\d+\.\d+)', text):
+            for m in re.findall(r'v(\d+\.\d+(?:\.\d+)?)', text):
                 self.assertEqual(
                     m, ver,
                     f'{bat} 中 v{m} 与 polyglot_build.VERSION={ver} 不一致')

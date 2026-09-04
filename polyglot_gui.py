@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Polyglot Builder - 图形界面 v1.2
+Polyglot Builder - 图形界面 v1.2.1
 
 现代极简设计 (VS Code / Notion 风格):
   - 扁平化设计，去除所有立体边框
@@ -963,12 +963,16 @@ class PolyglotGUI:
             '  3. 或安装并加入系统 PATH')
 
     def _selected_quality(self) -> Optional[str]:
-        """读取当前选中的质量档位 key (如 'high'/'medium'/'low'), 无效返回 None。"""
+        """读取当前选中的质量档位 key (如 'high'/'medium'/'low')。
+
+        未勾选"压缩表面视频"时返回 None (不压缩)——复选框才是开关,
+        下拉框只是档位选择; 此前只看下拉文案导致未勾选也会压缩 (bug)。
+        """
+        if not self._compress_var.get():
+            return None
         label = self._quality_combo.get()
-        for k in VIDEO_QUALITY:
-            if label.startswith(f'{k} -'):
-                return k
-        return DEFAULT_VIDEO_QUALITY if self._compress_var.get() else None
+        return getattr(self, '_quality_by_label', {}).get(
+            label, DEFAULT_VIDEO_QUALITY)
 
     # --------------------------------------------------------
     # 拖拽处理
@@ -1104,11 +1108,19 @@ class PolyglotGUI:
         # 外层文件变化时自动填充输出路径
         self._outer_path.trace_add('write', lambda *a: self._auto_output())
 
-        # === 选项区 (Deflate 压缩 / 表面视频压缩 + 档位) ===
-        # 并排显示: 所有控件在左侧单行排列, 无右侧文字, 避免浅灰底纹突出
-        # 带 ⓘ 图标提示该控件有悬浮说明
+        # === 选项区 (两行, 按功能分组, 左边缘对齐) ===
+        # 第一行: Deflate 压缩 (作用于内层 RAR 数据)。
+        # 第二行: "压缩表面视频" 整组 = 启用开关 + 档位下拉 + 硬件编码 同排,
+        #   靠"同排"表达从属; 两行都不缩进, 保证复选框左边缘对齐
+        #   (此前给第二行加 16px 缩进, 结果两行左边缘错开, 显得没对齐)。
+        # 为什么不用单行排全部 4 组: pack(side=LEFT) 不换行, 高 DPI 下会裁切
+        #   尾部控件 (v1.2 的"硬件编码看不到"即由此而来)。
         opt_frame = ttk.Frame(main)
         opt_frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
+        opt_row1 = ttk.Frame(opt_frame)
+        opt_row1.pack(fill=tk.X, pady=(0, 6))
+        opt_row2 = ttk.Frame(opt_frame)
+        opt_row2.pack(fill=tk.X)
 
         # 自定义复选框: 用 Unicode 方框字符代替系统 indicator,
         # 方框随字号放大, 无 image 依赖 (跨多 Tk 根安全)。
@@ -1133,7 +1145,9 @@ class PolyglotGUI:
                 master, textvariable=full, variable=var,
                 bg=C_BG, fg=C_TEXT, activebackground=C_BG,
                 activeforeground=C_TEXT, selectcolor=C_BG,
-                font=(FONT_ENTRY[0], 11),  # 与卡片输入框一致, 方框随字放大
+                # 字号跟随 FONT_ENTRY 派生 (默认 10→11, 视觉不变),
+                # 保证高 DPI/大字体下复选框也等比放大, 布局计算才准确
+                font=(FONT_ENTRY[0], FONT_ENTRY[1] + 1),
                 bd=0, highlightthickness=0, relief='flat',
                 indicatoron=False, compound=tk.LEFT,
                 command=cmd,
@@ -1142,7 +1156,7 @@ class PolyglotGUI:
             info = tk.Label(
                 master, text='\u24d8',
                 bg=C_BG, fg=C_TEXT_SEC,
-                font=(FONT_ENTRY[0], 8, 'bold'),
+                font=(FONT_ENTRY[0], max(7, FONT_ENTRY[1] - 2), 'bold'),
                 cursor='question_arrow',
                 bd=0, highlightthickness=0,
             )
@@ -1152,7 +1166,7 @@ class PolyglotGUI:
 
         self._deflate_var = tk.BooleanVar(value=False)
         deflate_cb, deflate_info = _mk_checkbox(
-            opt_frame, 'Deflate 压缩', self._deflate_var,
+            opt_row1, 'Deflate 压缩', self._deflate_var,
             info_tip='对内部 RAR 数据使用 Deflate 压缩。\n'
                      '默认关闭 (RAR 本身已高度压缩, 再压收益极小且更耗时)。\n'
                      '通常无需开启。')
@@ -1165,7 +1179,7 @@ class PolyglotGUI:
 
         self._compress_var = tk.BooleanVar(value=False)
         compress_cb, compress_info = _mk_checkbox(
-            opt_frame, '压缩表面视频', self._compress_var,
+            opt_row2, '压缩表面视频', self._compress_var,
             cmd=self._on_compress_toggle,
             info_tip='用 ffmpeg 压缩外层视频, 减小最终文件体积, 提高隐蔽性。\n\n'
                      '用长视频做外层并压缩, 可避免"表面是小文件却占用几个 G"\n'
@@ -1177,16 +1191,22 @@ class PolyglotGUI:
                 '用长视频做外层并压缩, 可避免"表面是小文件却占用几个 G"\n'
                 '的违和感, 降低被平台判定为异常文件的风险。')
 
-        # 质量档位下拉 (仅勾选时启用; 一直保持可点, 未勾选时灰显)
-        self._quality_var = tk.StringVar(value=DEFAULT_VIDEO_QUALITY)
-        quality_labels = [f'{k} - {VIDEO_QUALITY[k][2]}' for k in VIDEO_QUALITY]
+        # 质量档位下拉 (仅勾选时启用; 一直保持可点, 未勾选时灰显)。
+        # 与"压缩表面视频"开关、"硬件编码"同排, 表达三者同属一个功能。
+        # 显示文案只用短描述 (不带 key 前缀), 配合 width=18 控制宽度,
+        # 保证 200% 缩放下整组仍不超宽; key 通过反向映射解析。
+        self._quality_by_label = {VIDEO_QUALITY[k][2]: k for k in VIDEO_QUALITY}
+        quality_labels = [VIDEO_QUALITY[k][2] for k in VIDEO_QUALITY]
+        self._quality_var = tk.StringVar(
+            value=VIDEO_QUALITY[DEFAULT_VIDEO_QUALITY][2])
         self._quality_combo = ttk.Combobox(
-            opt_frame, state='disabled', width=26,  # 容纳 'medium - 中 (1.5Mbps, 720p)' 全长
+            opt_row2, state='disabled', width=18,  # 容纳 '中 1.5M/720p 推荐' 全长
             textvariable=self._quality_var, values=quality_labels,
             font=FONT_ENTRY,
         )
         self._quality_combo.pack(side=tk.LEFT, padx=(0, 12))
-        self._quality_combo.set(quality_labels[0])
+        # 不再 set(quality_labels[0]): StringVar 已默认为 medium 档文案,
+        # 覆盖成第一项 (high) 会让默认档位变成"高", 与"中 推荐"矛盾
         self._quality_labels = quality_labels
         Tooltip(self._quality_combo,
                 '压缩质量档位: 码率越低 / 分辨率越低, 体积越小。\n\n'
@@ -1200,7 +1220,7 @@ class PolyglotGUI:
         # 硬件编码的价值在于弱 CPU 机型, 或压缩时不想占满 CPU。
         self._hw_var = tk.BooleanVar(value=False)
         hw_cb, hw_info = _mk_checkbox(
-            opt_frame, '硬件编码', self._hw_var,
+            opt_row2, '硬件编码', self._hw_var,
             info_tip='用显卡/核显编码 (NVIDIA NVENC / Intel QSV / AMD AMF),\n'
                      '探测不到可用硬件时自动回退 CPU 编码。\n\n'
                      '默认关闭: 实测多核 CPU 上软编更快、画质更好\n'
