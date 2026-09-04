@@ -1,6 +1,6 @@
 # Polyglot Builder - 多格式文件拼接工具
 
-![CI](https://github.com/cghhvhnnnbvc/polyglot-builder/actions/workflows/ci.yml/badge.svg) ![版本](https://img.shields.io/badge/version-1.1-blue)
+![CI](https://github.com/cghhvhnnnbvc/polyglot-builder/actions/workflows/ci.yml/badge.svg) ![版本](https://img.shields.io/badge/version-1.2-blue)
 
 把媒体/文档文件与 AES-256 加密 RAR 拼接为一个"多格式文件"：**既能正常播放/打开，改后缀为 `.zip` 又能解压出加密 RAR**。
 

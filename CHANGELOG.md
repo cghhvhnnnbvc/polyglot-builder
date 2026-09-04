@@ -1,7 +1,8 @@
 # 更新记录 (Changelog)
 
-## 未发布 (Unreleased)
+## v1.2 (2026-09-04) — 压缩提速
 
+- **版本号**: 统一为 1.2 (`VERSION` 常量 / bat 窗口标题与横幅 / GUI 文件头 / README 徽章)
 - **压缩外层视频大幅提速**: 不再写死 `-preset medium`, 改为按档位取 `VIDEO_PRESET` (high→faster / medium→veryfast / low→ultrafast)。实测 1080p30 60s → 720p 1.5Mbps: 179fps → 353fps (medium 档, **约 2 倍**), low 档达 681fps (**约 3.8 倍**), 输出体积几乎不变
 - **音频智能直拷**: 探测源音轨, 已是 AAC 时用 `-c:a copy` (不重编码、不损音质), 无音轨时 `-an`, 其他编码才转 AAC 128k
 - **进度显示预计剩余时间**: 预热 3 秒后进度消息附加 `(预计还需 X 分 Y 秒)`; 开始压缩时日志会告知实际使用的编码器

@@ -57,10 +57,14 @@ pyinstaller --noconfirm polyglot_builder.spec
 - **自动发版** (`.github/workflows/release.yml`): 推送 `v*` 标签即触发:
 
   ```bash
-  git tag v1.1 && git push origin v1.1
+  git tag v1.2 && git push origin v1.2
   ```
 
   流程: 校验标签与 `VERSION` 常量一致 → 跑测试 → PyInstaller 打包 → 压缩 zip → 创建 GitHub Release (自带中文说明)。
+
+- **发版检查清单**: ① `VERSION` 常量 ② `polyglot_build.bat` 标题+2 处横幅 ③ `polyglot_gui.py` 文件头注释
+  ④ `README.md` 版本徽章 ⑤ `CHANGELOG.md` 把"未发布"改为新版本条目 ⑥ `release.yml` 的 `name` 副标题与"本版本新增"段落。
+  前三项不一致会被 `test_bat_versions_match_constant` 拦下; 发版前记得先改 `release.yml` 的本版亮点, 否则 Release 页会沿用上一版的说明。
 
 - **版本号单一来源**: `polyglot_build.py` 的 `VERSION` 常量; `polyglot_build.bat` 与 `README` 徽章需同步, `test_version_format` 等用例守护 bat 与常量一致。
 
