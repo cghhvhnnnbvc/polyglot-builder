@@ -808,7 +808,14 @@ class PolyglotGUI:
 
         self._setup_styles()
         self._create_widgets()
+        # 日志轮询的 after 句柄: 关窗/销毁前需取消, 否则 Tk 会报
+        # "invalid command name ..._poll_log_queue" (待执行的回调指向已删命令)
+        self._poll_after_id: Optional[str] = None
         self._poll_log_queue()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        # 兼顾关窗以外的销毁路径: 无论走关窗按钮还是直接 destroy (如测试),
+        # 都取消待执行的轮询回调
+        self.root.bind('<Destroy>', self._on_root_destroy)
 
         # 启用文件拖拽到主窗口 (Windows; 其他平台静默降级)
         _enable_drop(self.root, self._on_drop)
@@ -817,14 +824,15 @@ class PolyglotGUI:
     # 表面视频压缩
     # --------------------------------------------------------
     def _on_compress_toggle(self):
-        """勾选压缩时启用质量档位下拉; 取消时禁用。
+        """勾选压缩时启用质量档位下拉与硬件编码开关; 取消时禁用。
 
-        仅控制下拉框可用性 (勾选即变为可点/readonly), 保证下拉立即可用。
+        仅控制控件可用性 (勾选即变为可点/readonly), 保证下拉立即可用。
         ffmpeg 缺失的检测与引导下载延迟到构建时 (_run), 不阻塞本操作。
         """
         enabled = self._compress_var.get()
         self._quality_combo.configure(
             state='readonly' if enabled else 'disabled')
+        self._hw_cb.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _prompt_download_ffmpeg(self):
         """未检测到 ffmpeg 时, 弹出提示框让用户选择下载/取消。
@@ -1187,6 +1195,27 @@ class PolyglotGUI:
                 '· 低: 0.8Mbps, 480p (体积最小, 画面略糊)\n\n'
                 '仅勾选"压缩表面视频"后可用。')
 
+        # 硬件编码开关 (仅勾选压缩后启用)。
+        # 默认关闭: 实测多核 CPU 上 libx264 软编快于核显硬编且画质更好;
+        # 硬件编码的价值在于弱 CPU 机型, 或压缩时不想占满 CPU。
+        self._hw_var = tk.BooleanVar(value=False)
+        hw_cb, hw_info = _mk_checkbox(
+            opt_frame, '硬件编码', self._hw_var,
+            info_tip='用显卡/核显编码 (NVIDIA NVENC / Intel QSV / AMD AMF),\n'
+                     '探测不到可用硬件时自动回退 CPU 编码。\n\n'
+                     '默认关闭: 实测多核 CPU 上软编更快、画质更好\n'
+                     '(1080p→720p: libx264 veryfast ~328fps vs AMF ~301fps)。\n'
+                     '仅在弱 CPU 机型, 或希望压缩时不占满 CPU 时开启。')
+        hw_cb.pack(side=tk.LEFT, padx=(0, 2))
+        hw_info.pack(side=tk.LEFT, padx=(0, 12), pady=(4, 0))
+        hw_cb.configure(state=tk.DISABLED)
+        self._hw_cb = hw_cb
+        Tooltip(hw_cb,
+                '用显卡/核显编码, 探测不到可用硬件时自动回退 CPU 编码。\n\n'
+                '默认关闭: 实测多核 CPU 上软编更快且画质更好。\n'
+                '适合弱 CPU 机型, 或希望压缩时 CPU 不被占满。\n\n'
+                '仅勾选"压缩表面视频"后可用。')
+
         # === 构建按钮 (Canvas 圆角) ===
         btn_frame = ttk.Frame(main)
         btn_frame.grid(row=3, column=0, sticky='ew', pady=(0, 14))
@@ -1347,7 +1376,27 @@ class PolyglotGUI:
                 self._log(*self.log_queue.get_nowait())
         except queue.Empty:
             pass
-        self.root.after(50, self._poll_log_queue)
+        self._poll_after_id = self.root.after(50, self._poll_log_queue)
+
+    def _stop_polling(self) -> None:
+        """取消待执行的日志轮询回调 (关窗与测试销毁时避免 Tk 报错)。"""
+        if self._poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
+
+    def _on_close(self) -> None:
+        """窗口关闭: 先停轮询、中止进行中的构建, 再销毁。"""
+        self._stop_polling()
+        self._stop_event.set()
+        self.root.destroy()
+
+    def _on_root_destroy(self, event) -> None:
+        """根窗口销毁时取消日志轮询 (仅处理根窗口自身的事件)。"""
+        if event.widget is self.root:
+            self._stop_polling()
 
     def _export_log(self):
         """将日志文本另存为 .txt 文件 (便于事后排查/反馈问题)。"""
@@ -1470,7 +1519,8 @@ class PolyglotGUI:
                 # 压缩到临时路径
                 compressed_outer = self._temp_compressed_path(outer)
                 compress_video(outer, compressed_outer, quality=quality,
-                               callback=cb, stop_event=self._stop_event)
+                               callback=cb, stop_event=self._stop_event,
+                               use_hw=self._hw_var.get())
                 effective_outer = compressed_outer
 
             build_polyglot(effective_outer, rar, out, callback=cb,

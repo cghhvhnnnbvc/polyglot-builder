@@ -16,7 +16,7 @@
 | `polyglot_build.py` | 核心构建脚本 (GUI / CLI 共用核心逻辑) |
 | `polyglot_gui.py` | 图形界面 (tkinter, Python 标准库) |
 | `polyglot_ledger.py` | 资源台账模块 (JSON 数据源 + HTML 查看页生成 + 旧版迁移) |
-| `test_polyglot.py` | 回归测试 (unittest, 零依赖, 120 用例) |
+| `test_polyglot.py` | 回归测试 (unittest, 零依赖, 145 用例) |
 | `polyglot_builder.spec` | PyInstaller 打包配置 (onedir, 可选) |
 | `build_dist.bat` | 一键打包脚本 (装 PyInstaller → 跑测试 → 打包, 可选) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (mypy + unittest 多平台矩阵) |
@@ -27,7 +27,7 @@
 ## 运行测试与类型检查
 
 ```bash
-python -m unittest test_polyglot          # 120 用例, 零依赖
+python -m unittest test_polyglot          # 145 用例, 零依赖
 python -m mypy                            # Windows 视角
 python -m mypy --platform linux           # 模拟 CI ubuntu 视角
 ```
@@ -63,6 +63,24 @@ pyinstaller --noconfirm polyglot_builder.spec
   流程: 校验标签与 `VERSION` 常量一致 → 跑测试 → PyInstaller 打包 → 压缩 zip → 创建 GitHub Release (自带中文说明)。
 
 - **版本号单一来源**: `polyglot_build.py` 的 `VERSION` 常量; `polyglot_build.bat` 与 `README` 徽章需同步, `test_version_format` 等用例守护 bat 与常量一致。
+
+## 视频压缩的编码器约定
+
+- **默认 CPU 编码**: `libx264` + `VIDEO_PRESET` (high→faster / medium→veryfast / low→ultrafast)。
+  外层视频只是伪装道具, 低码率下 preset 带来的画质差异极小, 而速度差异达 2 倍以上
+  (实测 medium preset 179fps → veryfast 353fps → ultrafast 681fps, 输出体积几乎相同)。
+  **不要把 preset 改回 medium** —— 那是压缩耗时过长的主因。
+- **硬件编码为可选** (`use_hw=True` / CLI `--hw-encoder` / GUI “硬件编码”勾选):
+  实测核显硬编并不比多核 CPU 软编快 (h264_amf 316fps vs veryfast 353fps),
+  4K 源瓶颈在 CPU 解码+缩放, 故不做默认; 价值在于弱 CPU 机型与低 CPU 占用。
+- **探测必须实测**: `detect_hw_encoder()` 先看 `-encoders` 列表, 再用 `_test_encode()`
+  真编几帧验证 (编码器被列出 ≠ 本机有硬件)。探测片段必须够大且带码率:
+  64x64 会让 AMF `Init()` 失败造成假阴性 (已踩坑), 现用 640x360 + 3 帧 + `-b:v 1000k`。
+- **所有探测函数一律降级不抛错** (`_probe_audio_codec` / `detect_hw_encoder` / `_test_encode`
+  均 `except Exception`): 探测失败只能导致“少一个优化”, 绝不能让压缩主流程失败。
+- **GUI 轮询回调可取消**: `_poll_after_id` + `_stop_polling()`, 并绑定 `<Destroy>` 与
+  `WM_DELETE_WINDOW`; 否则销毁窗口时 Tk 会刷 `invalid command name ..._poll_log_queue`,
+  污染测试与 CI 日志。
 
 ## 资源台账模块约定
 

@@ -40,7 +40,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from contextlib import contextmanager
-from typing import Callable, IO, List, Optional, Tuple
+from typing import Callable, Dict, IO, List, Optional, Tuple
 
 # 进度回调签名: (phase, current, total, message) -> None
 ProgressCallback = Callable[[str, int, int, str], None]
@@ -794,6 +794,30 @@ VIDEO_QUALITY = {
 }
 DEFAULT_VIDEO_QUALITY = 'medium'
 
+# CPU 编码 (libx264) 时各档位的 preset。
+# 外层视频只是伪装道具, 没人会盯着看画质; 而低码率下 preset 带来的画质
+# 差异极小, 速度差异却达 2 倍以上 (实测 Ryzen 5 5600H, 1080p30 → 720p 1.5Mbps:
+# medium 179fps / veryfast 278fps / ultrafast 403fps, 输出体积完全相同),
+# 故按档位取偏速度的 preset (原本写死 medium 是压缩耗时过长的主要原因)。
+VIDEO_PRESET = {
+    'high': 'faster',
+    'medium': 'veryfast',
+    'low': 'ultrafast',
+}
+
+# 硬件 H.264 编码器候选 (按优先级) 及其参数。
+# 各家参数名不统一; 且"编码器被编译进 ffmpeg" 不等于"机器上有对应硬件"
+# (如无 N 卡时 h264_nvenc 仍会被列出, 但运行时报错), 因此使用前用
+# _test_encode() 做一次实测编码, 失败则跳到下一候选, 全部失败回退 libx264。
+_HW_ENCODERS: List[Tuple[str, List[str]]] = [
+    ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5']),      # NVIDIA
+    ('h264_qsv', ['-c:v', 'h264_qsv', '-preset', 'veryfast']),    # Intel 核显
+    ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'balanced']),   # AMD 核显/独显
+]
+_HW_ARGS: Dict[str, List[str]] = dict(_HW_ENCODERS)
+# 探测结果缓存 (按 ffmpeg 路径), 避免每次压缩都重跑实测
+_HW_CACHE: Dict[str, Optional[str]] = {}
+
 # ffmpeg 本地缓存目录 (首次压缩时下载到此, 之后复用)
 # 存放到程序所在目录下的 ffmpeg/ (源码运行=脚本目录, 打包=exe 目录)
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -983,14 +1007,132 @@ def _terminate_proc(proc: subprocess.Popen) -> None:
             pass
 
 
+def _probe_audio_codec(ffprobe: Optional[str], src: str) -> Optional[str]:
+    """探测源文件的音频编码名。
+
+    返回: 编码名 (如 'aac') / '' 表示无音轨 / None 表示无法探测。
+    """
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'a:0',
+             '-show_entries', 'stream=codec_name',
+             '-of', 'default=noprint_wrappers=1:nokey=1', src],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if out.returncode != 0:
+            return None
+        return out.stdout.decode('utf-8', 'ignore').strip()
+    except Exception:   # 探测失败一律降级为重编码, 绝不影响压缩主流程
+        return None
+
+
+def _audio_args(codec: Optional[str]) -> List[str]:
+    """根据源音频编码选择音频参数。
+
+    源已是 AAC 时直接拷贝流 (省一次重编码, 也不损音质);
+    无音轨时不写音频; 无法探测或为其他编码时重编码为 AAC。
+    """
+    if codec == '':
+        return ['-an']
+    if codec == 'aac':
+        return ['-c:a', 'copy']
+    return ['-c:a', 'aac', '-b:a', '128k']
+
+
+def _test_encode(ffmpeg: str, codec_args: List[str]) -> bool:
+    """用给定编码器参数实测编码几帧, 验证硬件真的可用。
+
+    探测片段必须足够大并带上码率参数: 硬件编码器对 64x64 这类极小
+    尺寸会直接 Init 失败 (实测 h264_amf 报 encoder->Init() failed),
+    造成"明明有硬件却回退 CPU"的假阴性。
+    """
+    try:
+        p = subprocess.run(
+            [ffmpeg, '-hide_banner', '-loglevel', 'error',
+             '-f', 'lavfi', '-i', 'color=black:s=640x360:d=0.2',
+             '-frames:v', '3',
+             *codec_args, '-b:v', '1000k', '-f', 'null', '-'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        return p.returncode == 0
+    except Exception:   # 实测失败即视为该硬件编码器不可用
+        return False
+
+
+def detect_hw_encoder(ffmpeg: str) -> Optional[str]:
+    """探测可用的硬件 H.264 编码器; 无可用时返回 None (回退 libx264)。
+
+    先看 `-encoders` 列表做廉价过滤, 再对候选做一次实测编码
+    (因为编码器被列出 ≠ 本机有对应硬件)。结果按 ffmpeg 路径缓存。
+    """
+    if ffmpeg in _HW_CACHE:
+        return _HW_CACHE[ffmpeg]
+
+    result: Optional[str] = None
+    try:
+        listed = subprocess.run(
+            [ffmpeg, '-hide_banner', '-encoders'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30).stdout.decode('utf-8', 'ignore')
+    except Exception:   # 拿不到编码器列表就当无硬件可用, 回退 libx264
+        listed = ''
+
+    if listed:
+        for name, args in _HW_ENCODERS:
+            if name not in listed:
+                continue
+            if _test_encode(ffmpeg, args):
+                result = name
+                break
+
+    _HW_CACHE[ffmpeg] = result
+    return result
+
+
+def _format_eta(seconds: float) -> str:
+    """把秒数格式化为中文可读时长。"""
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f'{total} 秒'
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f'{minutes} 分 {sec} 秒' if sec else f'{minutes} 分'
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours} 小时 {minutes} 分' if minutes else f'{hours} 小时'
+
+
+def _estimate_eta(elapsed_media: float, duration: float,
+                  t_start: float) -> Optional[str]:
+    """由已编码媒体时长与墙钟时间估算剩余时间; 样本不足时返回 None。
+
+    前 3 秒的采样波动大, 容易给出离谱的估计, 故不显示。
+    """
+    wall = time.time() - t_start
+    if wall < 3.0 or elapsed_media <= 0:
+        return None
+    speed = elapsed_media / wall          # 媒体秒 / 墙钟秒
+    remaining = (duration - elapsed_media) / speed
+    if remaining <= 0:
+        return None
+    return _format_eta(remaining)
+
+
 def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
                    callback: Optional[ProgressCallback] = None,
-                   stop_event: Optional[threading.Event] = None) -> str:
+                   stop_event: Optional[threading.Event] = None,
+                   use_hw: bool = False) -> str:
     """用 ffmpeg 压缩视频, 返回压缩后文件路径 dst。
 
     quality 取值见 VIDEO_QUALITY。ffmpeg 未安装时抛 OSError。
     通过 callback('info', ...) 报告阶段信息; 能探测到源时长时,
-    通过 callback('compress', pct, 100, ...) 报告编码进度百分比。
+    通过 callback('compress', pct, 100, ...) 报告编码进度百分比与预计剩余时间。
+
+    编码器选择 (use_hw):
+      - 默认 False: 用 libx264 + 档位对应的 VIDEO_PRESET。实测多核 CPU 上
+        软编快于核显硬编 (1080p→720p: veryfast 256-328fps vs h264_amf 254-301fps),
+        4K 源的瓶颈更是 CPU 解码+缩放, 硬编帮不上忙。
+      - True: 先探测并实测硬件编码器 (NVENC/QSV/AMF), 探测不到则回退 libx264。
+        适用于弱 CPU 机型, 或希望压缩时 CPU 不被占满。
 
     实现要点:
       - `-progress pipe:1 -nostats`: ffmpeg 把 key=value 进度写到 stdout, 按行解析
@@ -1011,13 +1153,29 @@ def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
             '或使用打包版 (已内置 ffmpeg)。')
 
     bitrate, max_height, _label = VIDEO_QUALITY[quality]
-    if callback:
-        callback('info', 0, 0,
-                 f'正在压缩表面视频 ({quality}, {bitrate // 1000}kbps)...')
 
-    # 探测源时长用于换算进度百分比 (缺 ffprobe/探测失败时降级为无百分比)
+    # 探测源时长 (换算进度百分比与 ETA) 与音频编码 (决定能否直拷)
     ffprobe = _find_ffprobe(ffmpeg)
     duration = _probe_duration(ffprobe, src) if ffprobe else None
+    audio_args = _audio_args(_probe_audio_codec(ffprobe, src))
+
+    # 编码器选择: 默认 CPU (libx264 + 档位 preset); use_hw 时才探测硬件加速
+    hw_encoder = detect_hw_encoder(ffmpeg) if use_hw else None
+    if hw_encoder:
+        codec_args = list(_HW_ARGS[hw_encoder])
+        encoder_desc = f'{hw_encoder} (硬件加速)'
+    else:
+        preset = VIDEO_PRESET[quality]
+        codec_args = ['-c:v', 'libx264', '-preset', preset]
+        encoder_desc = f'libx264 ({preset})'
+
+    if callback:
+        if use_hw and not hw_encoder:
+            callback('info', 0, 0,
+                     '未探测到可用的硬件编码器, 已回退 libx264 (CPU)。')
+        callback('info', 0, 0,
+                 f'正在压缩表面视频 ({quality}, {bitrate // 1000}kbps, '
+                 f'编码器: {encoder_desc})...')
 
     # 滤镜: 仅当原始高度高于 max_height 时按比例缩到该高度, 否则保持原尺寸
     # scale 宽: 高>max_height 时按比例(-2 保持偶数), 否则保持原宽(iw)
@@ -1026,10 +1184,10 @@ def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
 
     cmd = [
         ffmpeg, '-y', '-nostats', '-i', src,
-        '-c:v', 'libx264', '-preset', 'medium',
+        *codec_args,
         '-b:v', str(bitrate), '-maxrate', str(int(bitrate * 1.2)),
         '-bufsize', str(int(bitrate * 2)), '-vf', vf,
-        '-c:a', 'aac', '-b:a', '128k',
+        *audio_args,
         '-movflags', '+faststart',
         '-progress', 'pipe:1',
         dst,
@@ -1042,6 +1200,7 @@ def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
         with open(err_path, 'wb') as err_file:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_file)
             assert proc.stdout is not None
+            t_start = time.time()
             # 按行读取 -progress 输出; 每行都检查取消
             for raw in proc.stdout:
                 if stop_event is not None and stop_event.is_set():
@@ -1055,8 +1214,11 @@ def compress_video(src: str, dst: str, quality: str = DEFAULT_VIDEO_QUALITY,
                     elapsed = _parse_ffmpeg_time(val)
                     if elapsed is not None:
                         pct = min(100, int(elapsed * 100 / duration))
-                        callback('compress', pct, 100,
-                                 f'正在压缩表面视频... {pct}%')
+                        msg = f'正在压缩表面视频... {pct}%'
+                        eta = _estimate_eta(elapsed, duration, t_start)
+                        if eta:
+                            msg += f' (预计还需 {eta})'
+                        callback('compress', pct, 100, msg)
             proc.wait()
         if proc.returncode != 0:
             stderr_tail = ''
@@ -1157,7 +1319,8 @@ def _run_batch(args: argparse.Namespace, logger: logging.Logger) -> None:
             if args.compress:
                 compressed_outer = _temp_path_for_outer(outer)
                 compress_video(outer, compressed_outer,
-                               quality=args.compress, callback=callback)
+                               quality=args.compress, callback=callback,
+                               use_hw=args.hw_encoder)
                 effective_outer = compressed_outer
 
             if callback:
@@ -1299,6 +1462,14 @@ def main() -> None:
         help='压缩外层视频以减小最终文件体积 (提高隐蔽性)。'
              f'QUALITY: {", ".join(VIDEO_QUALITY)} (默认 {DEFAULT_VIDEO_QUALITY})。'
              '需安装 ffmpeg 或使用打包版'
+    )
+
+    parser.add_argument(
+        '--hw-encoder',
+        action='store_true',
+        help='压缩外层视频时使用硬件编码器 (NVENC/QSV/AMF, 探测不到则回退 libx264)。'
+             '默认用 CPU 编码: 实测多核 CPU 上软编更快, 硬件编码仅在弱 CPU 机型'
+             '或希望压缩时不占满 CPU 时推荐开启 (需配合 --compress)'
     )
 
     parser.add_argument(
@@ -1445,7 +1616,8 @@ def main() -> None:
         if args.compress:
             compressed_outer = _temp_path_for_outer(args.outer_file)
             compress_video(args.outer_file, compressed_outer,
-                           quality=args.compress, callback=callback)
+                           quality=args.compress, callback=callback,
+                           use_hw=args.hw_encoder)
             effective_outer = compressed_outer
 
         # 开始构建

@@ -510,6 +510,55 @@ class TestCLI(unittest.TestCase):
         self.assertIn('polyglot_compressed_', used_outer,
                       'build_polyglot 应使用压缩产物作为外层')
 
+    def test_cli_defaults_to_cpu_encoder(self):
+        """不加 --hw-encoder 时应走 CPU 编码 (use_hw=False)。"""
+        from unittest import mock
+        outer = self._make_file('m2.bin', b'OUTER' * 50)
+        rar = self._make_file('d2.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'o2.bin')
+        with mock.patch('polyglot_build.compress_video') as cv, \
+                mock.patch('polyglot_build.build_polyglot'), \
+                mock.patch('polyglot_build.verify_polyglot'):
+            code, _o, err = self._run_main(
+                ['polyglot_build.py', outer, rar, '-o', out, '-q',
+                 '--compress', 'medium'])
+        self.assertEqual(code, 0, err)
+        self.assertIs(cv.call_args[1].get('use_hw'), False)
+
+    def test_cli_hw_encoder_flag_passed_through(self):
+        """--hw-encoder 应透传给 compress_video (单文件与批量模式)。"""
+        from unittest import mock
+        outer = self._make_file('m3.bin', b'OUTER' * 50)
+        rar = self._make_file('d3.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'o3.bin')
+        with mock.patch('polyglot_build.compress_video') as cv, \
+                mock.patch('polyglot_build.build_polyglot'), \
+                mock.patch('polyglot_build.verify_polyglot'):
+            code, _o, err = self._run_main(
+                ['polyglot_build.py', outer, rar, '-o', out, '-q',
+                 '--compress', 'low', '--hw-encoder'])
+        self.assertEqual(code, 0, err)
+        self.assertIs(cv.call_args[1].get('use_hw'), True)
+        self.assertEqual(cv.call_args[1].get('quality'), 'low')
+
+    def test_cli_batch_passes_hw_encoder(self):
+        from unittest import mock
+        outer = self._make_file('b1.bin', b'OUTER' * 50)
+        rar = self._make_file('b1.rar', b'RAR' * 50)
+        out = os.path.join(self.tmpdir, 'b1out.bin')
+        manifest = os.path.join(self.tmpdir, 'b.txt')
+        with open(manifest, 'w', encoding='utf-8') as f:
+            f.write(f'{outer}|{rar}|{out}\n')
+        with mock.patch('polyglot_build.compress_video') as cv, \
+                mock.patch('polyglot_build.build_polyglot'), \
+                mock.patch('polyglot_build.verify_polyglot'):
+            code, _o, err = self._run_main(
+                ['polyglot_build.py', '--batch', manifest, '-q',
+                 '--compress', 'medium', '--hw-encoder'])
+        self.assertEqual(code, 0, err)
+        cv.assert_called_once()
+        self.assertIs(cv.call_args[1].get('use_hw'), True)
+
     def test_cli_gui_flag_dispatches_to_gui(self):
         # --gui: 分发到 polyglot_gui.launch_gui 并 sys.exit(0)
         from unittest import mock
@@ -816,6 +865,104 @@ class TestGuiRunFfmpegMissing(unittest.TestCase):
                         'ffmpeg 缺失时应将引导下载入队 (而非直接构建失败)')
         # 不应进入真正构建 (避免压缩失败)
         build.assert_not_called()
+
+
+class TestGuiHwEncoderToggle(unittest.TestCase):
+    """守护 GUI 硬件编码开关: 默认关闭/禁用, 随压缩勾选启用, 且透传给 compress_video。"""
+
+    def _build_gui(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        return root, gui
+
+    def test_hw_checkbox_default_off_and_disabled(self):
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        self.assertIs(gui._hw_var.get(), False, '硬件编码应默认关闭 (实测 CPU 更快)')
+        self.assertEqual(str(gui._hw_cb['state']), 'disabled',
+                         '未勾选压缩时开关应置灰')
+
+    def test_hw_checkbox_follows_compress_toggle(self):
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        gui._compress_var.set(True)
+        gui._on_compress_toggle()
+        self.assertEqual(str(gui._hw_cb['state']), 'normal')
+        gui._compress_var.set(False)
+        gui._on_compress_toggle()
+        self.assertEqual(str(gui._hw_cb['state']), 'disabled')
+
+    def _run_with(self, gui, root, hw):
+        from unittest import mock
+        tmpdir = tempfile.mkdtemp(prefix='gui_hw_')
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        outer = os.path.join(tmpdir, 'movie.mp4')
+        rar = os.path.join(tmpdir, 'data.rar')
+        out = os.path.join(tmpdir, 'output.bin')
+        gui._compress_var.set(True)
+        gui._hw_var.set(hw)
+        gui._on_compress_toggle()
+        with mock.patch('polyglot_gui.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_gui.compress_video') as cv, \
+                mock.patch('polyglot_gui.build_polyglot'), \
+                mock.patch('polyglot_gui.verify_polyglot'), \
+                mock.patch.object(root, 'after', lambda *a, **k: None):
+            gui._run(outer, rar, out)
+        return cv
+
+    def test_run_passes_use_hw_true_when_checked(self):
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        cv = self._run_with(gui, root, True)
+        cv.assert_called_once()
+        self.assertIs(cv.call_args[1].get('use_hw'), True)
+
+    def test_run_passes_use_hw_false_by_default(self):
+        root, gui = self._build_gui()
+        self.addCleanup(root.destroy)
+        cv = self._run_with(gui, root, False)
+        cv.assert_called_once()
+        self.assertIs(cv.call_args[1].get('use_hw'), False)
+
+
+class TestGuiPollingCleanup(unittest.TestCase):
+    """守护关窗/销毁时取消日志轮询 (避免 Tk 报 invalid command name)。"""
+
+    def _build_gui(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError as e:
+            self.skipTest(f'无可用显示环境, 跳过 GUI 测试: {e}')
+        root.geometry('880x700')
+        gui = PolyglotGUI(root)
+        root.update_idletasks()
+        return root, gui
+
+    def test_poll_after_id_tracked_and_cancellable(self):
+        root, gui = self._build_gui()
+        self.addCleanup(gui._stop_polling)
+        self.addCleanup(root.destroy)
+        self.assertIsNotNone(gui._poll_after_id, '初始化后应有一个待执行的轮询回调')
+        gui._stop_polling()
+        self.assertIsNone(gui._poll_after_id)
+        gui._stop_polling()   # 重复调用不应报错
+
+    def test_on_close_stops_build_and_destroys_window(self):
+        import tkinter as tk
+        root, gui = self._build_gui()
+        gui._on_close()
+        self.assertTrue(gui._stop_event.is_set(), '关窗应中止进行中的构建')
+        self.assertIsNone(gui._poll_after_id)
+        # 根窗口已销毁: 再向其发 Tcl 命令应报错
+        with self.assertRaises(tk.TclError):
+            root.winfo_exists()
 
 
 class TestGuiLayout(unittest.TestCase):
@@ -1791,6 +1938,240 @@ class TestLedgerManagerGUI(unittest.TestCase):
                 mock.patch.object(mgr, 'wait_window'):
             mgr._on_edit()
         self.assertEqual(load_records(self.path)[0].name, 'A')
+
+
+class TestCompressEncoderSelection(unittest.TestCase):
+    """守护压缩提速改造: preset 档位、硬件编码器探测与回退、音频直拷、ETA。"""
+
+    def setUp(self):
+        polyglot_build._HW_CACHE.clear()
+        self.addCleanup(polyglot_build._HW_CACHE.clear)
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    # ---------- preset 档位 ----------
+    def test_preset_defined_for_every_quality_tier(self):
+        self.assertEqual(set(polyglot_build.VIDEO_PRESET), set(VIDEO_QUALITY))
+        # 不再写死 medium: 各档均为偏速度的 preset
+        self.assertNotIn('medium', polyglot_build.VIDEO_PRESET.values())
+
+    # ---------- 音频参数 ----------
+    def test_audio_args_variants(self):
+        self.assertEqual(polyglot_build._audio_args(''), ['-an'])
+        self.assertEqual(polyglot_build._audio_args('aac'), ['-c:a', 'copy'])
+        self.assertEqual(polyglot_build._audio_args('mp3'),
+                         ['-c:a', 'aac', '-b:a', '128k'])
+        self.assertEqual(polyglot_build._audio_args(None),
+                         ['-c:a', 'aac', '-b:a', '128k'])
+
+    # ---------- 硬件编码器探测 ----------
+    def test_detect_hw_encoder_returns_none_when_ffmpeg_unusable(self):
+        with mock.patch.object(polyglot_build.subprocess, 'run',
+                               side_effect=OSError('not found')):
+            self.assertIsNone(polyglot_build.detect_hw_encoder('/no/ffmpeg'))
+
+    def test_detect_hw_encoder_skips_listed_but_unusable(self):
+        """nvenc 被列出但实测失败 (无 N 卡) -> 应跳到 amf。"""
+        def fake_run(cmd, **kw):
+            class R:
+                returncode = 0
+                stdout = b''
+                stderr = b''
+            r = R()
+            if '-encoders' in cmd:
+                r.stdout = (' V....D h264_nvenc\n V....D h264_qsv\n'
+                            ' V....D h264_amf\n V....D libx264\n').encode()
+            elif 'h264_nvenc' in cmd or 'h264_qsv' in cmd:
+                r.returncode = 1          # 硬件不可用
+            return r
+
+        with mock.patch.object(polyglot_build.subprocess, 'run', fake_run):
+            self.assertEqual(polyglot_build.detect_hw_encoder('/ff'), 'h264_amf')
+        # 结果已缓存: 再次调用不重复探测
+        with mock.patch.object(polyglot_build.subprocess, 'run',
+                               side_effect=AssertionError('不应再探测')):
+            self.assertEqual(polyglot_build.detect_hw_encoder('/ff'), 'h264_amf')
+
+    def test_detect_hw_encoder_none_when_all_fail(self):
+        def fake_run(cmd, **kw):
+            class R:
+                returncode = 1 if '-encoders' not in cmd else 0
+                stdout = b' V....D h264_nvenc\n' if '-encoders' in cmd else b''
+                stderr = b''
+            return R()
+
+        with mock.patch.object(polyglot_build.subprocess, 'run', fake_run):
+            self.assertIsNone(polyglot_build.detect_hw_encoder('/ff2'))
+
+    # ---------- compress_video 组装的命令 ----------
+    def _capture_cmd(self, quality='medium', hw=None, audio_codec=None,
+                     use_hw=False):
+        """跑一次 compress_video (均 mock), 捕获传给 ffmpeg 的命令行。"""
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                captured['cmd'] = cmd
+                self.stdout = iter([b'progress=end\n'])
+                self.returncode = 0
+
+            def wait(self, *a, **k):
+                return 0
+
+        dst = os.path.join(self.tmpdir, 'out.mp4')
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_build.detect_hw_encoder',
+                           return_value=hw) as det, \
+                mock.patch('polyglot_build._find_ffprobe', return_value=None), \
+                mock.patch('polyglot_build._probe_audio_codec',
+                           return_value=audio_codec), \
+                mock.patch.object(polyglot_build.subprocess, 'Popen', FakeProc), \
+                mock.patch.object(polyglot_build.os.path, 'exists',
+                                  return_value=False):
+            compress_video('in.mp4', dst, quality=quality, use_hw=use_hw)
+        captured['detect_calls'] = det.call_count
+        return captured['cmd'], captured['detect_calls']
+
+    def test_cmd_uses_hw_encoder_when_opted_in(self):
+        cmd, _calls = self._capture_cmd(hw='h264_amf', use_hw=True)
+        self.assertIn('h264_amf', cmd)
+        self.assertNotIn('libx264', cmd)
+        self.assertIn('-quality', cmd)
+
+    def test_default_never_probes_hardware(self):
+        """默认走 CPU: 不应去探测硬件编码器 (避免无意义的启动开销)。"""
+        cmd, calls = self._capture_cmd(hw='h264_amf', use_hw=False)
+        self.assertEqual(calls, 0, '默认不应调用 detect_hw_encoder')
+        self.assertIn('libx264', cmd)
+        self.assertNotIn('h264_amf', cmd)
+
+    def test_cmd_falls_back_to_libx264_with_tier_preset(self):
+        cmd, _calls = self._capture_cmd(quality='low', hw=None)
+        self.assertIn('libx264', cmd)
+        self.assertIn('ultrafast', cmd)
+        self.assertNotIn('medium', cmd, '不应再写死 medium preset')
+
+    def test_hw_requested_but_unavailable_falls_back_with_notice(self):
+        """开了硬件编码但探测不到: 回退 libx264 并告知用户。"""
+        msgs = []
+
+        def cb(phase, cur, total, msg):
+            msgs.append(msg)
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                self.cmd = cmd
+                self.stdout = iter([b'progress=end\n'])
+                self.returncode = 0
+
+            def wait(self, *a, **k):
+                return 0
+
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_build.detect_hw_encoder',
+                           return_value=None), \
+                mock.patch('polyglot_build._find_ffprobe', return_value=None), \
+                mock.patch('polyglot_build._probe_audio_codec',
+                           return_value=None), \
+                mock.patch.object(polyglot_build.subprocess, 'Popen', FakeProc), \
+                mock.patch.object(polyglot_build.os.path, 'exists',
+                                  return_value=False):
+            compress_video('in.mp4', os.path.join(self.tmpdir, 'fb.mp4'),
+                           callback=cb, use_hw=True)
+        text = ' '.join(msgs)
+        self.assertIn('未探测到可用的硬件编码器', text)
+        self.assertIn('libx264', text)
+
+    def test_cmd_copies_audio_when_source_is_aac(self):
+        cmd, _c = self._capture_cmd(hw=None, audio_codec='aac')
+        i = cmd.index('-c:a')
+        self.assertEqual(cmd[i + 1], 'copy')
+        self.assertNotIn('128k', cmd)
+
+    def test_cmd_drops_audio_when_source_has_none(self):
+        cmd, _c = self._capture_cmd(hw=None, audio_codec='')
+        self.assertIn('-an', cmd)
+        self.assertNotIn('-c:a', cmd)
+
+    def test_cmd_reencodes_audio_for_other_codec(self):
+        cmd, _c = self._capture_cmd(hw=None, audio_codec='mp3')
+        self.assertIn('128k', cmd)
+
+    def test_info_callback_reports_encoder(self):
+        msgs = []
+
+        def cb(phase, cur, total, msg):
+            msgs.append((phase, msg))
+
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                self.stdout = iter([b'progress=end\n'])
+                self.returncode = 0
+
+            def wait(self, *a, **k):
+                return 0
+
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_build.detect_hw_encoder',
+                           return_value='h264_qsv'), \
+                mock.patch('polyglot_build._find_ffprobe', return_value=None), \
+                mock.patch('polyglot_build._probe_audio_codec',
+                           return_value=None), \
+                mock.patch.object(polyglot_build.subprocess, 'Popen', FakeProc), \
+                mock.patch.object(polyglot_build.os.path, 'exists',
+                                  return_value=False):
+            compress_video('in.mp4', os.path.join(self.tmpdir, 'o.mp4'),
+                           callback=cb, use_hw=True)
+        info = ' '.join(m for p, m in msgs if p == 'info')
+        self.assertIn('h264_qsv', info)
+        self.assertIn('硬件加速', info)
+
+    # ---------- ETA ----------
+    def test_format_eta(self):
+        self.assertEqual(polyglot_build._format_eta(30), '30 秒')
+        self.assertEqual(polyglot_build._format_eta(90), '1 分 30 秒')
+        self.assertEqual(polyglot_build._format_eta(600), '10 分')
+        self.assertEqual(polyglot_build._format_eta(3660), '1 小时 1 分')
+
+    def test_estimate_eta_needs_enough_samples(self):
+        # 墙钟不足 3 秒 -> 不给估计
+        self.assertIsNone(polyglot_build._estimate_eta(1.0, 100.0, time.time()))
+        # 已跑 10 秒完成 5 秒媒体, 总长 100 秒 -> 剩余约 190 秒
+        eta = polyglot_build._estimate_eta(5.0, 100.0, time.time() - 10)
+        self.assertIsNotNone(eta)
+        self.assertIn('分', eta)
+
+    def test_progress_message_contains_eta(self):
+        class FakeProc:
+            def __init__(self, cmd, **kw):
+                self.stdout = iter([b'out_time=00:00:05.000000\n',
+                                    b'progress=end\n'])
+                self.returncode = 0
+
+            def wait(self, *a, **k):
+                return 0
+
+        msgs = []
+
+        def cb(phase, cur, total, msg):
+            if phase == 'compress':
+                msgs.append(msg)
+
+        with mock.patch('polyglot_build.find_ffmpeg', return_value='/ff'), \
+                mock.patch('polyglot_build.detect_hw_encoder', return_value=None), \
+                mock.patch('polyglot_build._find_ffprobe', return_value='/fp'), \
+                mock.patch('polyglot_build._probe_duration', return_value=10.0), \
+                mock.patch('polyglot_build._probe_audio_codec',
+                           return_value=None), \
+                mock.patch('polyglot_build._estimate_eta', return_value='2 分'), \
+                mock.patch.object(polyglot_build.subprocess, 'Popen', FakeProc), \
+                mock.patch.object(polyglot_build.os.path, 'exists',
+                                  return_value=False):
+            compress_video('in.mp4', os.path.join(self.tmpdir, 'o2.mp4'),
+                           callback=cb)
+        self.assertTrue(msgs)
+        self.assertIn('50%', msgs[0])
+        self.assertIn('预计还需 2 分', msgs[0])
 
 
 if __name__ == '__main__':

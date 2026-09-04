@@ -21,9 +21,10 @@ python polyglot_build.py <外层文件> <加密RAR> [-o 输出文件] [选项]
 | `--no-verify` | 跳过构建后 ZIP 完整性校验 |
 | `-y / --force` | 强制覆盖已存在的输出文件, 不交互询问 (适合脚本/CI) |
 | `--compress [QUALITY]` | 压缩外层视频以减小体积、提高隐蔽性 (需 ffmpeg); QUALITY: `high`/`medium`/`low`, 默认 `medium` |
+| `--hw-encoder` | 压缩时改用硬件编码器 (NVENC/QSV/AMF, 探测不到则回退 libx264); 默认用 CPU 编码, 需配合 `--compress` |
 | `--batch MANIFEST` | 批量模式: 指定清单文本文件 (见下文) |
 | `--log-file PATH` | 将日志额外持久化到指定文件 (追加模式, UTF-8), 便于事后排查 |
-| `--ledger PATH` | 资源台账文件 (HTML): 构建成功后追加一条记录, 文件不存在则自动创建 |
+| `--ledger PATH` | 资源台账数据文件 (推荐 `.json`): 构建成功后追加一条记录, 不存在则自动创建; 同名 `.html` 查看页自动生成 (传旧版 `.html` 路径也会自动迁移) |
 | `--ledger-name TEXT` | 台账记录的资源名称 (缺省用输出文件名) |
 | `--ledger-netdisk TEXT` | 台账记录的网盘平台, 如 `百度网盘` |
 | `--ledger-location TEXT` | 台账记录的网盘位置/目录, 如 `/我的资源/2026` |
@@ -53,6 +54,27 @@ python polyglot_build.py --gui
 # 第三段输出可省略, 缺省时与外层同名
 D:\media\v1.mp4|D:\rar\s1.rar|D:\out\v1.mp4
 D:\media\v2.mp4|D:\rar\s2.rar
+```
+
+## 压缩外层视频的速度
+
+压缩是最耗时的一步 (时长正比于源视频长度)。当前策略:
+
+- **默认用 CPU 编码** `libx264`，preset 按档位区分: `high` → faster、`medium` → veryfast、`low` → ultrafast。
+  实测 (Ryzen 5 5600H, 1080p30 60s → 720p 1.5Mbps): medium 档 353fps、low 档 681fps，
+  相比旧版写死的 `medium` preset (179fps) **提速约 2-3.8 倍**
+- **音频自动直拷**: 源音轨已是 AAC 时用 `-c:a copy` (不重编码、不损音质); 无音轨时 `-an`
+- **进度带预计剩余时间**: 预热 3 秒后，进度消息会附加 `(预计还需 X 分 Y 秒)`
+- **`--hw-encoder` 为可选项，默认关闭**: 实测核显硬编 (h264_amf 316fps) 并不比
+  CPU 软编 (353fps) 快，4K 源的瓶颈更是 CPU 解码+缩放。仅在弱 CPU 机型，
+  或希望压缩时 CPU 不被占满时才建议开启; 探测不到硬件会自动回退并在日志中告知
+
+```bash
+# 弱 CPU 机器 / 想边压缩边干别的:
+python polyglot_build.py long_4k.mp4 data.rar --compress medium --hw-encoder
+
+# 赶时间、不在意画质 (外层只是伪装道具):
+python polyglot_build.py long.mp4 data.rar --compress low
 ```
 
 ## 资源台账 (--ledger)

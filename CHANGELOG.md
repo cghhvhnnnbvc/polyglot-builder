@@ -1,5 +1,16 @@
 # 更新记录 (Changelog)
 
+## 未发布 (Unreleased)
+
+- **压缩外层视频大幅提速**: 不再写死 `-preset medium`, 改为按档位取 `VIDEO_PRESET` (high→faster / medium→veryfast / low→ultrafast)。实测 1080p30 60s → 720p 1.5Mbps: 179fps → 353fps (medium 档, **约 2 倍**), low 档达 681fps (**约 3.8 倍**), 输出体积几乎不变
+- **音频智能直拷**: 探测源音轨, 已是 AAC 时用 `-c:a copy` (不重编码、不损音质), 无音轨时 `-an`, 其他编码才转 AAC 128k
+- **进度显示预计剩余时间**: 预热 3 秒后进度消息附加 `(预计还需 X 分 Y 秒)`; 开始压缩时日志会告知实际使用的编码器
+- **硬件编码改为可选**: 新增 CLI `--hw-encoder` 与 GUI “硬件编码”勾选 (仅勾选压缩后启用); 实测核显硬编 (h264_amf 316fps) 并不比多核 CPU 软编 (353fps) 快, 4K 源瓶颈在 CPU 解码+缩放, 故默认不开; 探测不到硬件时自动回退并在日志告知
+- **fix: 硬件编码器探测假阴性**: 探测片段原为 64x64, AMF 会 `encoder->Init() failed` 导致“明明有硬件却回退 CPU”; 改为 640x360 + 3 帧 + 带码率后探测正确
+- **fix: 探测函数不再拖垮主流程**: `_probe_audio_codec` / `detect_hw_encoder` / `_test_encode` 改为捕获任意异常并降级 (原本只捕 OSError/SubprocessError)
+- **fix: 关窗时 Tk 报 `invalid command name ..._poll_log_queue`**: 日志轮询回调改为可取消 (`_poll_after_id` + `_stop_polling()`), 并绑定 `WM_DELETE_WINDOW` (关窗同时中止进行中的构建) 与 `<Destroy>`
+- **其他**: 测试 120 → 145 用例; 文档同步 (docs/cli.md 新增“压缩速度”节与 `--hw-encoder`、docs/development.md 新增编码器约定)
+
 ## v1.1 (2026-09-03) — 资源台账
 
 - **版本号**: 统一为 1.1 (`VERSION` 常量 / bat 窗口标题与横幅 / GUI 文件头 / README 徽章)
